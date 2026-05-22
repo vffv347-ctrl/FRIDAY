@@ -1,0 +1,19 @@
+{
+  "name": "friday",
+  "version": "0.1.0",
+  "private": true,
+  "description": "F.R.I.D.A.Y — персональная ИИ-ассистентка: сайт, бэк-офис и Telegram-бот",
+  "packageManager": "pnpm@10.33.4",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "start": "turbo run start",
+    "lint": "turbo run lint"
+  },
+  "devDependencies": {
+    "turbo": "^2.3.3"
+  }
+}

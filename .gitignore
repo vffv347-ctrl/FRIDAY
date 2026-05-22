@@ -1,0 +1,22 @@
+# dependencies
+node_modules/
+
+# builds
+.next/
+out/
+dist/
+.turbo/
+
+# env — никогда не коммитим ключи
+.env
+.env.local
+.env*.local
+
+# misc
+*.log
+npm-debug.log*
+.DS_Store
+coverage/
+
+# runtime data (напоминания и пр. — до переезда в Supabase)
+data/
