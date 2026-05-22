@@ -6,7 +6,7 @@ import {
   type Context,
 } from "grammy";
 import { loadConfig } from "./config";
-import { initFriday, runFriday, askFridayOnce } from "./friday";
+import { initFriday, runFriday, askFridayOnce, MODEL_LIGHT } from "./friday";
 import { createOwnerGuard } from "./ownerGuard";
 import {
   getHistory,
@@ -370,6 +370,8 @@ function main(): void {
             );
           },
         },
+        // Брифинги — фоновые, используют дешёвый Haiku, инструменты включены.
+        { model: MODEL_LIGHT, briefing: true },
       );
       await appendUser(
         ownerId,

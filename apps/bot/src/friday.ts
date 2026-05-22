@@ -82,6 +82,46 @@ export function initFriday(
   openaiKey = openaiApiKey;
 }
 
+// ── Выбор движка ──────────────────────────────────────────────────
+// По умолчанию — Sonnet (5× дешевле Opus, тех же возможностей хватает).
+// Opus подключается только когда владелец явно просит «думать хорошо».
+// Haiku — для авто-брифингов (фоновые задачи, цена почти ноль).
+const MODEL_DEFAULT = "claude-sonnet-4-6";
+const MODEL_HEAVY = "claude-opus-4-7";
+const MODEL_LIGHT = "claude-haiku-4-5-20251001";
+
+const HEAVY_TRIGGERS =
+  /думай\s+хорошо|думай\s+как\s+(?:следует|надо|опус)|на\s+максималк|на\s+полную|включи\s+опус|режим\s+опус|тяжел[ыа]й\s+режим|подумай\s+как\s+следует/i;
+
+// Чистая болтовня без действия — на ней инструменты не нужны, экономим
+// 4–6к токенов на запрос. Список намеренно узкий: при любом сомнении
+// инструменты остаются включёнными.
+const CHITCHAT_ONLY =
+  /^(привет|здравствуй|здаров|здаров[ао]|доброе\s+утро|добрый\s+день|добрый\s+вечер|спасибо|спс|благодарю|ок|окей|ладно|понятно|ясно|хорошо|отлично|круто|класс|пока|до\s+встречи|как\s+дела|как\s+ты|кто\s+ты|что\s+ты\s+(умеешь|можешь|делаешь))[\s\.\!\?\)\(]*$/i;
+
+function lastUserText(messages: Anthropic.MessageParam[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== "user") continue;
+    if (typeof m.content === "string") return m.content;
+    if (Array.isArray(m.content)) {
+      for (const block of m.content) {
+        if (block.type === "text") return block.text;
+      }
+    }
+  }
+  return "";
+}
+
+function pickModel(userText: string): string {
+  if (HEAVY_TRIGGERS.test(userText)) return MODEL_HEAVY;
+  return MODEL_DEFAULT;
+}
+
+function isChitchat(userText: string): boolean {
+  return CHITCHAT_ONLY.test(userText.trim());
+}
+
 // ── Инструменты F.R.I.D.A.Y. ──────────────────────────────────────
 const TOOLS: Anthropic.Messages.ToolUnion[] = [
   {
@@ -505,10 +545,18 @@ async function executeTool(
 }
 
 // ── Агентный диалог (с инструментами и историей) ──────────────────
+export type RunFridayOptions = {
+  /** Принудительно задать модель (например, MODEL_LIGHT для брифингов). */
+  model?: string;
+  /** Брифинг: всегда оставляем инструменты, не реагируем на chit-chat-эвристику. */
+  briefing?: boolean;
+};
+
 export async function runFriday(
   history: Anthropic.MessageParam[],
   chatId: number,
   callbacks: FridayCallbacks,
+  options: RunFridayOptions = {},
 ): Promise<string> {
   if (!client) {
     throw new Error("Движок FRIDAY не инициализирован — вызови initFriday()");
@@ -518,6 +566,11 @@ export async function runFriday(
   }
 
   const messages: Anthropic.MessageParam[] = [...history];
+  const userText = lastUserText(messages);
+  const model = options.model ?? pickModel(userText);
+  // Болтовня вроде «привет» / «спасибо» инструментов не требует — экономим
+  // токены. Брифинги всегда с инструментами (там нужно дёргать задачи и пр.).
+  const useTools = options.briefing || !isChitchat(userText);
 
   // Долговременная память + свои команды владельца — в контекст разговора.
   const facts = await getFacts(chatId);
@@ -545,12 +598,12 @@ export async function runFriday(
 
   for (let step = 0; step < 10; step++) {
     const response = await client.messages.create({
-      model: "claude-opus-4-7",
+      model,
       max_tokens: 8000,
       thinking: { type: "adaptive" },
       output_config: { effort: "low" },
       system,
-      tools: TOOLS,
+      ...(useTools ? { tools: TOOLS } : {}),
       messages,
       ...(containerId ? { container: containerId } : {}),
     });
@@ -593,13 +646,22 @@ export async function runFriday(
 export async function askFridayOnce(
   systemExtra: string,
   userContent: string | Anthropic.ContentBlockParam[],
+  options: { model?: string } = {},
 ): Promise<string> {
   if (!client) {
     throw new Error("Движок FRIDAY не инициализирован — вызови initFriday()");
   }
 
+  const textInUser =
+    typeof userContent === "string"
+      ? userContent
+      : userContent
+          .map((block) => (block.type === "text" ? block.text : ""))
+          .join(" ");
+  const model = options.model ?? pickModel(textInUser);
+
   const response = await client.messages.create({
-    model: "claude-opus-4-7",
+    model,
     max_tokens: 8000,
     thinking: { type: "adaptive" },
     output_config: { effort: "low" },
@@ -612,3 +674,6 @@ export async function askFridayOnce(
     "Хм, я не смогла сформулировать ответ. Попробуй переспросить."
   );
 }
+
+// Константы движков экспортируем — index.ts использует MODEL_LIGHT для брифингов.
+export { MODEL_DEFAULT, MODEL_HEAVY, MODEL_LIGHT };
