@@ -359,14 +359,61 @@ function formatMsk(iso: string): string {
 }
 
 function systemBlocks(extra?: string): Anthropic.TextBlockParam[] {
+  const trimmedExtra = extra?.trim();
   const blocks: Anthropic.TextBlockParam[] = [
-    { type: "text", text: PERSONA, cache_control: { type: "ephemeral" } },
+    { type: "text", text: PERSONA },
   ];
-  if (extra && extra.trim()) {
-    blocks.push({ type: "text", text: extra });
+  if (trimmedExtra) {
+    blocks.push({ type: "text", text: trimmedExtra });
   }
+  // Cache breakpoint на последнем статичном блоке — кешируем персону + факты
+  // целиком. dateLine идёт ПОСЛЕ breakpoint: он меняется каждую минуту, иначе
+  // ломал бы кеш всей персоны.
+  const lastStatic = blocks.length - 1;
+  blocks[lastStatic] = {
+    ...blocks[lastStatic],
+    cache_control: { type: "ephemeral" },
+  };
   blocks.push({ type: "text", text: dateLine() });
   return blocks;
+}
+
+// Кешируем весь блок инструментов: cache_control на последнем тулзе означает,
+// что Anthropic закеширует системный промпт + все tools одним блоком. На
+// повторных запросах в 5-минутном окне эти ~5к токенов считаются по
+// «cached input» цене (10× дешевле обычного input).
+function cachedTools(): Anthropic.Messages.ToolUnion[] {
+  const result = [...TOOLS];
+  const lastIdx = result.length - 1;
+  result[lastIdx] = {
+    ...result[lastIdx],
+    cache_control: { type: "ephemeral" },
+  } as (typeof result)[number];
+  return result;
+}
+
+// Добавляем cache breakpoint на предпоследнее сообщение — кешируется вся
+// история диалога кроме текущего хода. На следующем сообщении владельца
+// кеш-хит на всём, что было до него.
+function withMessageCache(
+  messages: Anthropic.MessageParam[],
+): Anthropic.MessageParam[] {
+  if (messages.length < 2) return messages;
+  const result = [...messages];
+  const idx = result.length - 2;
+  const m = result[idx];
+  const blocks: Anthropic.ContentBlockParam[] =
+    typeof m.content === "string"
+      ? [{ type: "text", text: m.content }]
+      : [...m.content];
+  if (blocks.length === 0) return messages;
+  const lastIdx = blocks.length - 1;
+  blocks[lastIdx] = {
+    ...blocks[lastIdx],
+    cache_control: { type: "ephemeral" },
+  } as (typeof blocks)[number];
+  result[idx] = { ...m, content: blocks };
+  return result;
 }
 
 function extractText(response: Anthropic.Message): string {
@@ -565,12 +612,14 @@ export async function runFriday(
     return "Не получила сообщение — напиши ещё раз, пожалуйста.";
   }
 
-  const messages: Anthropic.MessageParam[] = [...history];
+  // Cache breakpoint на предпоследнем сообщении — вся история кешируется.
+  const messages: Anthropic.MessageParam[] = withMessageCache([...history]);
   const userText = lastUserText(messages);
   const model = options.model ?? pickModel(userText);
   // Болтовня вроде «привет» / «спасибо» инструментов не требует — экономим
   // токены. Брифинги всегда с инструментами (там нужно дёргать задачи и пр.).
   const useTools = options.briefing || !isChitchat(userText);
+  const tools = useTools ? cachedTools() : undefined;
 
   // Долговременная память + свои команды владельца — в контекст разговора.
   const facts = await getFacts(chatId);
@@ -603,7 +652,7 @@ export async function runFriday(
       thinking: { type: "adaptive" },
       output_config: { effort: "low" },
       system,
-      ...(useTools ? { tools: TOOLS } : {}),
+      ...(tools ? { tools } : {}),
       messages,
       ...(containerId ? { container: containerId } : {}),
     });
