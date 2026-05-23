@@ -62,20 +62,25 @@ type PendingPayment = {
 export default async function AdminPage() {
   const supabase = await createClient();
 
-  const { data: usersData } = await supabase
+  // subscriptions и payments оба ссылаются на profiles дважды (user_id и
+  // activated_by/confirmed_by). На неоднозначном embed PostgREST возвращает
+  // ошибку, и пользователи пропадают. Явно указываем нужный FK по user_id.
+  const { data: usersData, error: usersError } = await supabase
     .from("profiles")
     .select(
-      "id, email, full_name, role, created_at, subscriptions(status, expires_at, plan, engine, message_limit), bots(status, owner_telegram_id)",
+      "id, email, full_name, role, created_at, subscriptions!subscriptions_user_id_fkey(status, expires_at, plan, engine, message_limit), bots!bots_user_id_fkey(status, owner_telegram_id)",
     )
     .order("created_at", { ascending: true });
+  if (usersError) console.error("admin: profiles query error:", usersError);
 
-  const { data: paymentsData } = await supabase
+  const { data: paymentsData, error: paymentsError } = await supabase
     .from("payments")
     .select(
-      "id, amount, currency, period_days, method, created_at, profiles(email, full_name)",
+      "id, amount, currency, period_days, method, created_at, profiles!payments_user_id_fkey(email, full_name)",
     )
     .eq("status", "pending")
     .order("created_at", { ascending: true });
+  if (paymentsError) console.error("admin: payments query error:", paymentsError);
 
   const users = (usersData ?? []) as UserRow[];
   const pending = (paymentsData ?? []) as unknown as PendingPayment[];
