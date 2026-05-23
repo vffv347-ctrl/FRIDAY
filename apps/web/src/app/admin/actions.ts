@@ -98,7 +98,11 @@ export async function setEngineLimit(formData: FormData) {
   const userId = String(formData.get("user_id") ?? "");
   const engine = String(formData.get("engine") ?? "");
   const limit = Number(formData.get("message_limit") ?? 0);
-  if (!userId || !["haiku", "sonnet", "opus"].includes(engine) || limit <= 0) {
+  if (
+    !userId ||
+    !["haiku", "sonnet", "opus", "hybrid"].includes(engine) ||
+    limit <= 0
+  ) {
     return;
   }
 

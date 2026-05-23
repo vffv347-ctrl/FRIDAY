@@ -12,7 +12,9 @@ export type Profile = {
 
 export type SubscriptionStatus = "inactive" | "active" | "expired";
 
-export type Engine = "haiku" | "sonnet" | "opus";
+// 'hybrid' — Sonnet по умолчанию + Opus автоматически по триггерам
+// владельца («думай хорошо», «на максималке»). То же, что у superadmin.
+export type Engine = "haiku" | "sonnet" | "opus" | "hybrid";
 
 export type Subscription = {
   id: string;

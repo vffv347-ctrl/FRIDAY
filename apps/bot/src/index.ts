@@ -100,8 +100,12 @@ async function sendLong(ctx: Context, text: string): Promise<void> {
 }
 
 // ── Подписка → движок Claude ─────────────────────────────────────
-type Engine = "haiku" | "sonnet" | "opus";
-const ENGINE_MODELS: Record<Engine, string> = {
+// 'hybrid' — Sonnet по умолчанию + автоматический апгрейд до Opus по
+// триггерам владельца («думай хорошо» и т.п.). Это тот же режим, который
+// идёт по умолчанию у superadmin через env, теперь его можно дать любому
+// пользователю через /admin.
+type Engine = "haiku" | "sonnet" | "opus" | "hybrid";
+const ENGINE_MODELS: Record<Exclude<Engine, "hybrid">, string> = {
   haiku: MODEL_LIGHT,
   sonnet: MODEL_DEFAULT,
   opus: MODEL_HEAVY,
@@ -131,7 +135,10 @@ async function fetchSubInfo(userId: string): Promise<SubInfo> {
       const engine = data.engine as Engine;
       if (
         notExpired &&
-        (engine === "haiku" || engine === "sonnet" || engine === "opus")
+        (engine === "haiku" ||
+          engine === "sonnet" ||
+          engine === "opus" ||
+          engine === "hybrid")
       ) {
         sub = { engine };
       }
@@ -572,6 +579,8 @@ async function syncSupervisor(envBot: {
       resolveModel: async () => {
         const sub = await fetchSubInfo(userId);
         if (!sub) return null;
+        // 'hybrid' → undefined: friday.ts сам подберёт Sonnet или Opus.
+        if (sub.engine === "hybrid") return undefined;
         return ENGINE_MODELS[sub.engine];
       },
     };

@@ -14,6 +14,7 @@ const ENGINE_SHORT: Record<string, string> = {
   haiku: "Haiku",
   sonnet: "Sonnet",
   opus: "Opus",
+  hybrid: "Гибрид (Sonnet+Opus)",
 };
 
 function fmtDate(s: string | null): string {
@@ -236,6 +237,7 @@ export default async function AdminPage() {
                     <option value="haiku">Haiku</option>
                     <option value="sonnet">Sonnet</option>
                     <option value="opus">Opus</option>
+                    <option value="hybrid">Гибрид</option>
                   </select>
                   <input
                     name="message_limit"
