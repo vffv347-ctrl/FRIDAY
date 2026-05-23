@@ -124,6 +124,16 @@ function isChitchat(userText: string): boolean {
   return CHITCHAT_ONLY.test(userText.trim());
 }
 
+// Haiku 4.5 не поддерживает adaptive thinking — Anthropic API на нём
+// падает с 400 «adaptive thinking is not supported on this model». Только
+// Sonnet/Opus умеют. Возвращаем настройку thinking только там, где она работает.
+function thinkingFor(
+  model: string,
+): { type: "adaptive" } | undefined {
+  if (model.includes("haiku")) return undefined;
+  return { type: "adaptive" };
+}
+
 // ── Инструменты F.R.I.D.A.Y. ──────────────────────────────────────
 const TOOLS: Anthropic.Messages.ToolUnion[] = [
   {
@@ -871,11 +881,13 @@ export async function runFriday(
   // между шагами цикла — иначе следующий запрос падает с 400.
   let containerId: string | undefined;
 
+  const thinking = thinkingFor(model);
+
   for (let step = 0; step < 10; step++) {
     const response = await client.messages.create({
       model,
       max_tokens: 8000,
-      thinking: { type: "adaptive" },
+      ...(thinking ? { thinking } : {}),
       output_config: { effort: "low" },
       system,
       ...(tools ? { tools } : {}),
@@ -935,10 +947,11 @@ export async function askFridayOnce(
           .join(" ");
   const model = options.model ?? pickModel(textInUser);
 
+  const thinking = thinkingFor(model);
   const response = await client.messages.create({
     model,
     max_tokens: 8000,
-    thinking: { type: "adaptive" },
+    ...(thinking ? { thinking } : {}),
     output_config: { effort: "low" },
     system: systemBlocks(systemExtra),
     messages: [{ role: "user", content: userContent }],
