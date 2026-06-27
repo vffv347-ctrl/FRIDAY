@@ -5,6 +5,7 @@ import {
   InputFile,
   type Context,
 } from "grammy";
+import type Anthropic from "@anthropic-ai/sdk";
 import { loadConfig } from "./config";
 import {
   initFriday,
@@ -26,6 +27,170 @@ import { readDocument } from "./documents";
 import { popDueReminders } from "./reminders";
 import { initDb, db } from "./db";
 import { SMART_COMMANDS } from "./commands";
+
+// ── Буфер сообщений (дебаунс) ────────────────────────────────────
+// Накапливаем все входящие за одну «волну» (пересланные, картинки,
+// голосовые, документы) и отправляем Claude одним батчем.
+type MsgItem =
+  | { type: "text"; text: string; forwarded: boolean }
+  | { type: "image"; base64: string; caption?: string }
+  | { type: "voice"; text: string }
+  | { type: "doc"; text: string; filename: string }
+  | { type: "pdf"; base64: string; filename: string; caption?: string };
+
+type ChatBuffer = {
+  items: MsgItem[];
+  timer: ReturnType<typeof setTimeout>;
+  ctx: Context;
+  model: string | undefined;
+};
+
+const DEBOUNCE_MS = 3_000;
+const chatBuffers = new Map<number, ChatBuffer>();
+
+function bufferItem(
+  ctx: Context,
+  chatId: number,
+  item: MsgItem,
+  model: string | undefined,
+): void {
+  const existing = chatBuffers.get(chatId);
+  if (existing) {
+    clearTimeout(existing.timer);
+    existing.items.push(item);
+    existing.ctx = ctx;
+    existing.timer = setTimeout(() => flushBuffer(chatId), DEBOUNCE_MS);
+  } else {
+    const timer = setTimeout(() => flushBuffer(chatId), DEBOUNCE_MS);
+    chatBuffers.set(chatId, { items: [item], timer, ctx, model });
+  }
+  ctx.replyWithChatAction("typing").catch(() => {});
+}
+
+function flushBuffer(chatId: number): void {
+  const buf = chatBuffers.get(chatId);
+  if (!buf) return;
+  chatBuffers.delete(chatId);
+  void processBatch(buf.ctx, chatId, buf.items, buf.model);
+}
+
+async function processBatch(
+  ctx: Context,
+  chatId: number,
+  items: MsgItem[],
+  model: string | undefined,
+): Promise<void> {
+  if (items.length === 0) return;
+  await ctx.replyWithChatAction("typing");
+
+  try {
+    const history = await getHistory(chatId);
+
+    // Собираем блоки контента для Claude
+    const blocks: Anthropic.ContentBlockParam[] = [];
+
+    const imageItems = items.filter((i) => i.type === "image") as Extract<MsgItem, { type: "image" }>[];
+    const pdfItems   = items.filter((i) => i.type === "pdf")   as Extract<MsgItem, { type: "pdf" }>[];
+    const forwarded  = items.filter((i) => i.type === "text" && i.forwarded) as Extract<MsgItem, { type: "text" }>[];
+    const direct     = items.filter((i) => i.type === "text" && !i.forwarded) as Extract<MsgItem, { type: "text" }>[];
+    const voices     = items.filter((i) => i.type === "voice") as Extract<MsgItem, { type: "voice" }>[];
+    const docs       = items.filter((i) => i.type === "doc")   as Extract<MsgItem, { type: "doc" }>[];
+
+    // Картинки — перед текстом
+    for (const img of imageItems) {
+      blocks.push({
+        type: "image",
+        source: { type: "base64", media_type: "image/jpeg", data: img.base64 },
+      });
+    }
+
+    // PDF-документы
+    for (const pdf of pdfItems) {
+      blocks.push({
+        type: "document",
+        source: { type: "base64", media_type: "application/pdf", data: pdf.base64 },
+      } as Anthropic.ContentBlockParam);
+    }
+
+    // Текстовый блок: пересланные → голосовые → документы → картинки-подписи → прямые
+    const parts: string[] = [];
+
+    if (forwarded.length > 0) {
+      parts.push(
+        `[Пересланные сообщения — ${forwarded.length} шт.]:\n` +
+        forwarded.map((m, i) => `${i + 1}. ${m.text}`).join("\n"),
+      );
+    }
+    for (const v of voices) {
+      parts.push(`[Голосовое]: ${v.text}`);
+    }
+    for (const d of docs) {
+      parts.push(`[Документ «${d.filename}»]:\n${d.text}`);
+    }
+    for (const pdf of pdfItems) {
+      if (pdf.caption) parts.push(`[Задание к PDF «${pdf.filename}»]: ${pdf.caption}`);
+    }
+    for (const img of imageItems) {
+      if (img.caption) parts.push(`[Подпись к изображению]: ${img.caption}`);
+    }
+    if (direct.length > 0) {
+      parts.push(direct.map((m) => m.text).join("\n"));
+    }
+
+    if (parts.length > 0) {
+      blocks.push({ type: "text", text: parts.join("\n\n") });
+    }
+
+    if (blocks.length === 0) return;
+
+    // Краткое резюме для сохранения в БД
+    const dbSummary = [
+      forwarded.length > 0 ? `[${forwarded.length} пересланных]` : "",
+      voices.length > 0    ? `[${voices.length} голосовых]` : "",
+      imageItems.length > 0 ? `[${imageItems.length} изображений]` : "",
+      pdfItems.length > 0  ? `[${pdfItems.length} PDF]` : "",
+      docs.length > 0      ? `[${docs.length} документов]` : "",
+      direct.map((m) => m.text).join(" ").slice(0, 300),
+    ].filter(Boolean).join(" ").trim();
+
+    await appendUser(chatId, dbSummary || "[сообщение]");
+
+    const messages: Anthropic.MessageParam[] = [
+      ...history,
+      { role: "user" as const, content: blocks },
+    ];
+
+    let produced = false;
+    const reply = await runFriday(
+      messages,
+      chatId,
+      {
+        onImage: async (image, caption) => {
+          produced = true;
+          await ctx.replyWithPhoto(
+            new InputFile(image, "friday.png"),
+            caption ? { caption } : undefined,
+          );
+        },
+        onDocument: async (file, filename) => {
+          produced = true;
+          await ctx.replyWithDocument(new InputFile(file, filename));
+        },
+      },
+      model ? { model } : undefined,
+    );
+
+    await appendAssistant(
+      chatId,
+      reply || (produced ? "[отправила файл]" : "Готово."),
+    );
+    if (reply) await sendLong(ctx, reply);
+    else if (!produced) await ctx.reply("Готово.");
+  } catch (err) {
+    console.error("Ошибка обработки батча:", err);
+    await ctx.reply("Что-то сбойнуло на моей стороне. Попробуй ещё раз.");
+  }
+}
 
 const GREETING = `Привет! Я F.R.I.D.A.Y. — твоя личная ассистентка. 🤖
 
@@ -169,45 +334,6 @@ const running = new Map<string, { bot: Bot; cfg: BotConfig }>();
 // Маршрутизация напоминаний: ownerTelegramId → бот для отправки.
 const ownerToBot = new Map<number, Bot>();
 
-// ── Общая обработка текста (для текстовых сообщений и расшифрованного голоса) ──
-async function handleText(
-  ctx: Context,
-  chatId: number,
-  text: string,
-  model: string | undefined,
-): Promise<void> {
-  const history = await getHistory(chatId);
-  await appendUser(chatId, text);
-  const messages = [...history, { role: "user" as const, content: text }];
-
-  let produced = false;
-  const reply = await runFriday(
-    messages,
-    chatId,
-    {
-      onImage: async (image, caption) => {
-        produced = true;
-        await ctx.replyWithPhoto(
-          new InputFile(image, "friday.png"),
-          caption ? { caption } : undefined,
-        );
-      },
-      onDocument: async (file, filename) => {
-        produced = true;
-        await ctx.replyWithDocument(new InputFile(file, filename));
-      },
-    },
-    model ? { model } : undefined,
-  );
-
-  await appendAssistant(
-    chatId,
-    reply || (produced ? "[отправила файл]" : "Готово."),
-  );
-
-  if (reply) await sendLong(ctx, reply);
-  else if (!produced) await ctx.reply("Готово.");
-}
 
 // ── Конструируем экземпляр бота с обработчиками ────────────────────
 function setupBot(cfg: BotConfig): Bot {
@@ -265,13 +391,15 @@ function setupBot(cfg: BotConfig): Bot {
   bot.on("message:text", async (ctx) => {
     const model = await gate(ctx);
     if (model === null) return;
-    await ctx.replyWithChatAction("typing");
-    try {
-      await handleText(ctx, ctx.chat.id, ctx.message.text, model ?? undefined);
-    } catch (err) {
-      console.error("Ошибка обработки текста:", err);
-      await ctx.reply("Что-то сбойнуло на моей стороне. Попробуй ещё раз.");
-    }
+    const isForwarded =
+      !!ctx.message.forward_origin ||
+      !!(ctx.message as Record<string, unknown>).forward_from;
+    bufferItem(
+      ctx,
+      ctx.chat.id,
+      { type: "text", text: ctx.message.text, forwarded: isForwarded },
+      model ?? undefined,
+    );
   });
 
   bot.on("message:voice", async (ctx) => {
@@ -289,15 +417,12 @@ function setupBot(cfg: BotConfig): Bot {
       if (!file.file_path) throw new Error("Telegram не вернул путь к файлу");
       const url = `https://api.telegram.org/file/bot${cfg.token}/${file.file_path}`;
       const audio = Buffer.from(await (await fetch(url)).arrayBuffer());
-
       const text = await transcribeVoice(audio, cfg.openaiKey);
       if (!text) {
         await ctx.reply("Не разобрала голосовое — повтори, пожалуйста?");
         return;
       }
-
-      await ctx.replyWithChatAction("typing");
-      await handleText(ctx, ctx.chat.id, text, model ?? undefined);
+      bufferItem(ctx, ctx.chat.id, { type: "voice", text }, model ?? undefined);
     } catch (err) {
       console.error("Ошибка обработки голосового:", err);
       await ctx.reply("Не получилось распознать голосовое. Попробуй ещё раз.");
@@ -316,30 +441,13 @@ function setupBot(cfg: BotConfig): Bot {
       const url = `https://api.telegram.org/file/bot${cfg.token}/${file.file_path}`;
       const image = Buffer.from(await (await fetch(url)).arrayBuffer());
       const base64 = image.toString("base64");
-
       const caption = ctx.message.caption?.trim();
-      const prompt =
-        caption ||
-        "Посмотри на изображение: опиши, что на нём, и оцени — что хорошо, а что можно улучшить.";
-
-      const reply = await askFridayOnce(
-        "",
-        [
-          {
-            type: "image",
-            source: { type: "base64", media_type: "image/jpeg", data: base64 },
-          },
-          { type: "text", text: prompt },
-        ],
-        model ? { model } : undefined,
-      );
-
-      await appendUser(
+      bufferItem(
+        ctx,
         ctx.chat.id,
-        `[прислал изображение] ${caption ?? ""}`.trim(),
+        { type: "image", base64, caption },
+        model ?? undefined,
       );
-      await appendAssistant(ctx.chat.id, reply);
-      await sendLong(ctx, reply);
     } catch (err) {
       console.error("Ошибка обработки картинки:", err);
       await ctx.reply("Не получилось разобрать картинку. Попробуй ещё раз.");
@@ -365,11 +473,8 @@ function setupBot(cfg: BotConfig): Bot {
       if (!file.file_path) throw new Error("Telegram не вернул путь к файлу");
       const url = `https://api.telegram.org/file/bot${cfg.token}/${file.file_path}`;
       const buffer = Buffer.from(await (await fetch(url)).arrayBuffer());
-
       const result = await readDocument(buffer, fileName, doc.mime_type);
-      const task =
-        ctx.message.caption?.trim() ||
-        "Изучи документ: кратко перескажи суть и главное, что в нём.";
+      const caption = ctx.message.caption?.trim();
 
       if (result.kind === "unsupported") {
         await ctx.reply(
@@ -378,40 +483,30 @@ function setupBot(cfg: BotConfig): Bot {
         return;
       }
 
-      let reply: string;
       if (result.kind === "pdf") {
-        reply = await askFridayOnce(
-          "",
-          [
-            {
-              type: "document",
-              source: {
-                type: "base64",
-                media_type: "application/pdf",
-                data: result.base64,
-              },
-            },
-            { type: "text", text: task },
-          ],
-          model ? { model } : undefined,
+        bufferItem(
+          ctx,
+          ctx.chat.id,
+          { type: "pdf", base64: result.base64, filename: fileName, caption },
+          model ?? undefined,
         );
       } else {
-        const note = result.truncated
-          ? "\n\n(документ длинный — взяла начало)"
-          : "";
-        reply = await askFridayOnce(
-          "",
-          `Документ «${fileName}»:\n\n${result.text}${note}\n\n---\nЗадание: ${task}`,
-          model ? { model } : undefined,
+        const note = result.truncated ? "\n\n(документ длинный — взяла начало)" : "";
+        bufferItem(
+          ctx,
+          ctx.chat.id,
+          { type: "doc", text: result.text + note, filename: fileName },
+          model ?? undefined,
         );
+        if (caption) {
+          bufferItem(
+            ctx,
+            ctx.chat.id,
+            { type: "text", text: caption, forwarded: false },
+            model ?? undefined,
+          );
+        }
       }
-
-      await appendUser(
-        ctx.chat.id,
-        `[прислал документ: ${fileName}] ${ctx.message.caption ?? ""}`.trim(),
-      );
-      await appendAssistant(ctx.chat.id, reply);
-      await sendLong(ctx, reply);
     } catch (err) {
       console.error("Ошибка обработки документа:", err);
       await ctx.reply("Не получилось прочитать документ. Попробуй ещё раз.");

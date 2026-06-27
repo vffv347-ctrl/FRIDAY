@@ -14,7 +14,7 @@ const ENGINE_SHORT: Record<string, string> = {
   haiku: "Haiku",
   sonnet: "Sonnet",
   opus: "Opus",
-  hybrid: "Гибрид (Sonnet+Opus)",
+  hybrid: "Гибрид",
 };
 
 function fmtDate(s: string | null): string {
@@ -24,6 +24,11 @@ function fmtDate(s: string | null): string {
     month: "short",
     year: "numeric",
   });
+}
+
+function daysLeft(expires: string | null): number | null {
+  if (!expires) return null;
+  return Math.ceil((new Date(expires).getTime() - Date.now()) / 86_400_000);
 }
 
 type Sub = {
@@ -60,7 +65,12 @@ type PendingPayment = {
   profiles: { email: string; full_name: string | null } | null;
 };
 
-export default async function AdminPage() {
+export default async function AdminPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ message?: string; error?: string }>;
+}) {
+  const sp = await searchParams;
   const supabase = await createClient();
 
   // subscriptions и payments оба ссылаются на profiles дважды (user_id и
@@ -81,7 +91,8 @@ export default async function AdminPage() {
     )
     .eq("status", "pending")
     .order("created_at", { ascending: true });
-  if (paymentsError) console.error("admin: payments query error:", paymentsError);
+  if (paymentsError)
+    console.error("admin: payments query error:", paymentsError);
 
   const users = (usersData ?? []) as UserRow[];
   const pending = (paymentsData ?? []) as unknown as PendingPayment[];
@@ -95,6 +106,8 @@ export default async function AdminPage() {
     "rounded-lg bg-glow text-night font-medium px-3 py-2 text-sm hover:opacity-90 transition-opacity";
   const ghostBtn =
     "rounded-lg border border-line px-3 py-2 text-sm text-dim hover:text-fg transition-colors";
+  const pill =
+    "text-xs px-2.5 py-1 rounded-full border whitespace-nowrap inline-flex items-center gap-1";
 
   return (
     <div className="space-y-6">
@@ -105,6 +118,18 @@ export default async function AdminPage() {
           оплатил.
         </p>
       </div>
+
+      {/* Сообщения после действий */}
+      {sp.message && (
+        <div className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 text-emerald-200 px-4 py-3 text-sm">
+          {sp.message}
+        </div>
+      )}
+      {sp.error && (
+        <div className="rounded-lg border border-red-500/40 bg-red-500/10 text-red-200 px-4 py-3 text-sm">
+          {sp.error}
+        </div>
+      )}
 
       {/* Статистика */}
       <div className="grid grid-cols-3 gap-4">
@@ -139,7 +164,8 @@ export default async function AdminPage() {
                   </div>
                   <div className="text-dim">
                     {p.amount} {p.currency} · {p.period_days} дн.
-                    {p.method ? ` · ${p.method}` : ""} · {fmtDate(p.created_at)}
+                    {p.method ? ` · ${p.method}` : ""} ·{" "}
+                    {fmtDate(p.created_at)}
                   </div>
                 </div>
                 <div className="flex gap-2">
@@ -170,31 +196,78 @@ export default async function AdminPage() {
             const sub = u.subscriptions?.[0];
             const active = isActiveSub(sub);
             const bot = u.bots?.[0];
+            const left = active ? daysLeft(sub?.expires_at ?? null) : null;
+
             return (
-              <li key={u.id} className="border border-line rounded-xl p-4">
-                <div className="text-sm">
-                  <div className="font-medium flex items-center gap-2">
-                    {u.full_name || u.email}
-                    {u.role !== "user" && (
-                      <span className="text-[10px] uppercase tracking-wider text-iris border border-line rounded px-1.5 py-0.5">
-                        {u.role}
-                      </span>
-                    )}
-                  </div>
-                  <div className="text-dim">{u.email}</div>
-                  <div className="text-dim mt-1">
-                    Подписка:{" "}
+              <li
+                key={u.id}
+                className={
+                  "border rounded-xl p-4 " +
+                  (active ? "border-emerald-500/30" : "border-line")
+                }
+              >
+                {/* Заголовок: имя/email + статусные плашки */}
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="font-medium">{u.full_name || u.email}</div>
+                  {u.role !== "user" && (
                     <span
-                      className={active ? "text-emerald-300" : "text-amber-300"}
+                      className={
+                        pill +
+                        " border-iris/40 bg-iris/10 text-iris uppercase tracking-wider"
+                      }
                     >
-                      {active ? "активна" : "не активна"}
+                      {u.role}
                     </span>
-                    {sub?.expires_at && ` · до ${fmtDate(sub.expires_at)}`}
-                    {sub && ` · тариф: ${sub.plan}`}
-                    {sub && ` · движок: ${ENGINE_SHORT[sub.engine] ?? sub.engine}`}
-                    {sub && ` · лимит: ${sub.message_limit}/мес`}
-                    {` · бот: ${bot?.status === "connected" ? "да" : "нет"}`}
-                  </div>
+                  )}
+                  <span
+                    className={
+                      pill +
+                      " " +
+                      (active
+                        ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-200"
+                        : "border-amber-500/40 bg-amber-500/10 text-amber-200")
+                    }
+                  >
+                    <span className="text-base leading-none">●</span>
+                    {active ? "подписка активна" : "подписка не активна"}
+                  </span>
+                  {sub && (
+                    <span
+                      className={
+                        pill +
+                        " border-glow/40 bg-glow/10 text-glow"
+                      }
+                    >
+                      движок: {ENGINE_SHORT[sub.engine] ?? sub.engine}
+                    </span>
+                  )}
+                  <span
+                    className={
+                      pill +
+                      " " +
+                      (bot?.status === "connected"
+                        ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-200"
+                        : "border-line bg-night text-dim")
+                    }
+                  >
+                    бот:{" "}
+                    {bot?.status === "connected"
+                      ? "подключён"
+                      : "не подключён"}
+                  </span>
+                </div>
+
+                <div className="text-dim text-xs mt-1">
+                  {u.email}
+                  {active && sub?.expires_at && (
+                    <>
+                      {" · "}до {fmtDate(sub.expires_at)}
+                      {left !== null && ` (${left} дн.)`}
+                    </>
+                  )}
+                  {sub && ` · тариф: ${sub.plan}`}
+                  {sub && ` · лимит: ${sub.message_limit}/мес`}
+                  {bot?.owner_telegram_id && ` · tg id ${bot.owner_telegram_id}`}
                 </div>
 
                 {/* Активация тарифа */}
@@ -204,7 +277,11 @@ export default async function AdminPage() {
                 >
                   <input type="hidden" name="user_id" value={u.id} />
                   <span className="text-xs text-dim">Тариф:</span>
-                  <select name="tariff" defaultValue="standard" className={inputCls}>
+                  <select
+                    name="tariff"
+                    defaultValue="standard"
+                    className={inputCls}
+                  >
                     {TARIFFS.map((t) => (
                       <option key={t.id} value={t.id}>
                         {t.name}
@@ -234,10 +311,10 @@ export default async function AdminPage() {
                     defaultValue={sub?.engine ?? "haiku"}
                     className={inputCls}
                   >
-                    <option value="haiku">Haiku</option>
-                    <option value="sonnet">Sonnet</option>
-                    <option value="opus">Opus</option>
-                    <option value="hybrid">Гибрид</option>
+                    <option value="haiku">Haiku — слабый, экономный</option>
+                    <option value="sonnet">Sonnet — средний</option>
+                    <option value="opus">Opus — сильный</option>
+                    <option value="hybrid">Гибрид — Sonnet + Opus по триггеру</option>
                   </select>
                   <input
                     name="message_limit"
@@ -253,9 +330,9 @@ export default async function AdminPage() {
                     <button
                       type="submit"
                       formAction={revokeSubscription}
-                      className={ghostBtn}
+                      className={ghostBtn + " text-amber-300/80 hover:text-amber-200"}
                     >
-                      Отключить подписку
+                      Отключить
                     </button>
                   )}
                 </form>

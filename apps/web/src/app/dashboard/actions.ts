@@ -45,6 +45,14 @@ export async function connectBot(formData: FormData) {
   );
 
   revalidatePath("/dashboard");
+  redirect(
+    "/dashboard?message=" +
+      encodeURIComponent(
+        connected
+          ? `✅ Бот${botUsername ? ` @${botUsername.replace(/^@/, "")}` : ""} подключён. F.R.I.D.A.Y. поднимет его в течение ~30 секунд — открой бота в Telegram и напиши «привет», чтобы проверить.`
+          : "Настройки сохранены. Для подключения боту нужны и токен от @BotFather, и твой Telegram ID (узнать в @userinfobot).",
+      ),
+  );
 }
 
 // Заявка пользователя на тариф (подтверждает администратор).

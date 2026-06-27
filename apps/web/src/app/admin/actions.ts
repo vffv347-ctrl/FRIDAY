@@ -1,11 +1,25 @@
 "use server";
 
-import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { getTariff } from "@/lib/tariffs";
 
 type ServerClient = Awaited<ReturnType<typeof createClient>>;
+
+const ENGINE_LABELS: Record<string, string> = {
+  haiku: "Haiku",
+  sonnet: "Sonnet",
+  opus: "Opus",
+  hybrid: "Гибрид (Sonnet + Opus по триггеру)",
+};
+
+function toAdminWithMessage(message: string): never {
+  redirect("/admin?message=" + encodeURIComponent(message));
+}
+
+function toAdminWithError(error: string): never {
+  redirect("/admin?error=" + encodeURIComponent(error));
+}
 
 // Проверяет, что текущий пользователь — администратор.
 async function requireAdmin(): Promise<{
@@ -30,6 +44,26 @@ async function requireAdmin(): Promise<{
   return { supabase, adminId: user.id };
 }
 
+async function userLabel(
+  supabase: ServerClient,
+  userId: string,
+): Promise<string> {
+  const { data } = await supabase
+    .from("profiles")
+    .select("email, full_name")
+    .eq("id", userId)
+    .maybeSingle();
+  return data?.full_name || data?.email || "пользователь";
+}
+
+function fmtDate(iso: string): string {
+  return new Date(iso).toLocaleDateString("ru-RU", {
+    day: "2-digit",
+    month: "long",
+    year: "numeric",
+  });
+}
+
 // Активирует / продлевает подписку с выбранным тарифом.
 // Если подписка ещё действует — продлевает от даты окончания.
 async function applyGrant(
@@ -38,7 +72,7 @@ async function applyGrant(
   userId: string,
   days: number,
   tariffId: string,
-) {
+): Promise<{ engine: string; expires: string }> {
   const { data: existing } = await supabase
     .from("subscriptions")
     .select("*")
@@ -53,11 +87,12 @@ async function applyGrant(
     if (exp > now) base = exp;
   }
   const expires = new Date(base.getTime() + days * 86_400_000);
+  const engine = tariff?.engine ?? existing?.engine ?? "haiku";
 
   const payload = {
     user_id: userId,
     plan: tariffId,
-    engine: tariff?.engine ?? existing?.engine ?? "haiku",
+    engine,
     message_limit: tariff?.messageLimit ?? existing?.message_limit ?? 1000,
     status: "active" as const,
     starts_at: existing?.starts_at ?? now.toISOString(),
@@ -78,6 +113,8 @@ async function applyGrant(
     target_user_id: userId,
     details: { days, tariff: tariffId, expires_at: expires.toISOString() },
   });
+
+  return { engine, expires: expires.toISOString() };
 }
 
 // Включить тариф пользователю на срок.
@@ -86,10 +123,15 @@ export async function grantSubscription(formData: FormData) {
   const userId = String(formData.get("user_id") ?? "");
   const days = Number(formData.get("days") ?? 30);
   const tariff = String(formData.get("tariff") ?? "standard") || "standard";
-  if (!userId || !days) return;
+  if (!userId || !days) return toAdminWithError("Не указан пользователь или срок.");
 
-  await applyGrant(supabase, adminId, userId, days, tariff);
-  revalidatePath("/admin");
+  const result = await applyGrant(supabase, adminId, userId, days, tariff);
+  const tariffInfo = getTariff(tariff);
+  const who = await userLabel(supabase, userId);
+
+  return toAdminWithMessage(
+    `✅ ${who}: тариф ${tariffInfo?.name ?? tariff} активирован до ${fmtDate(result.expires)} (движок ${ENGINE_LABELS[result.engine] ?? result.engine}). Бот применит через ~30 секунд.`,
+  );
 }
 
 // Ручная настройка: движок и лимит сообщений (без привязки к тарифу).
@@ -103,10 +145,10 @@ export async function setEngineLimit(formData: FormData) {
     !["haiku", "sonnet", "opus", "hybrid"].includes(engine) ||
     limit <= 0
   ) {
-    return;
+    return toAdminWithError("Проверь движок и лимит сообщений.");
   }
 
-  await supabase
+  const { error } = await supabase
     .from("subscriptions")
     .update({
       plan: "custom",
@@ -116,19 +158,30 @@ export async function setEngineLimit(formData: FormData) {
     })
     .eq("user_id", userId);
 
+  if (error) {
+    console.error("setEngineLimit error:", error);
+    return toAdminWithError(
+      `Не удалось сохранить движок: ${error.message}. Возможно, миграция 0005_hybrid_engine.sql ещё не применена в Supabase.`,
+    );
+  }
+
   await supabase.from("audit_log").insert({
     actor_id: adminId,
     action: "set_engine_limit",
     target_user_id: userId,
     details: { engine, message_limit: limit },
   });
-  revalidatePath("/admin");
+
+  const who = await userLabel(supabase, userId);
+  return toAdminWithMessage(
+    `✅ ${who}: движок переключён на ${ENGINE_LABELS[engine] ?? engine}, лимит ${limit}/мес. Бот применит через ~30 секунд.`,
+  );
 }
 
 export async function revokeSubscription(formData: FormData) {
   const { supabase, adminId } = await requireAdmin();
   const userId = String(formData.get("user_id") ?? "");
-  if (!userId) return;
+  if (!userId) return toAdminWithError("Не указан пользователь.");
 
   await supabase
     .from("subscriptions")
@@ -140,20 +193,24 @@ export async function revokeSubscription(formData: FormData) {
     action: "revoke_subscription",
     target_user_id: userId,
   });
-  revalidatePath("/admin");
+
+  const who = await userLabel(supabase, userId);
+  return toAdminWithMessage(
+    `🛑 ${who}: подписка отключена. Бот перестанет отвечать через ~30 секунд.`,
+  );
 }
 
 export async function confirmPayment(formData: FormData) {
   const { supabase, adminId } = await requireAdmin();
   const paymentId = String(formData.get("payment_id") ?? "");
-  if (!paymentId) return;
+  if (!paymentId) return toAdminWithError("Не указан id заявки.");
 
   const { data: payment } = await supabase
     .from("payments")
     .select("*")
     .eq("id", paymentId)
     .single();
-  if (!payment) return;
+  if (!payment) return toAdminWithError("Заявка не найдена.");
 
   await supabase
     .from("payments")
@@ -164,24 +221,30 @@ export async function confirmPayment(formData: FormData) {
   const tariffId = ["standard", "pro", "ultimaximum"].includes(payment.method)
     ? payment.method
     : "standard";
-  await applyGrant(
+  const result = await applyGrant(
     supabase,
     adminId,
     payment.user_id,
     payment.period_days,
     tariffId,
   );
-  revalidatePath("/admin");
+
+  const tariffInfo = getTariff(tariffId);
+  const who = await userLabel(supabase, payment.user_id);
+  return toAdminWithMessage(
+    `✅ Оплата подтверждена. ${who}: тариф ${tariffInfo?.name ?? tariffId} активен до ${fmtDate(result.expires)} (движок ${ENGINE_LABELS[result.engine] ?? result.engine}).`,
+  );
 }
 
 export async function rejectPayment(formData: FormData) {
   const { supabase, adminId } = await requireAdmin();
   const paymentId = String(formData.get("payment_id") ?? "");
-  if (!paymentId) return;
+  if (!paymentId) return toAdminWithError("Не указан id заявки.");
 
   await supabase
     .from("payments")
     .update({ status: "rejected", confirmed_by: adminId })
     .eq("id", paymentId);
-  revalidatePath("/admin");
+
+  return toAdminWithMessage("Заявка отклонена.");
 }
