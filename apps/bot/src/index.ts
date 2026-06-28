@@ -637,6 +637,12 @@ function setupBot(cfg: BotConfig): Bot {
     return `${chatId}:${msgId}`;
   }
 
+  // Когда владелец сам пишет в business-чате — запоминаем время и образцы стиля.
+  // Если он активен в чате (< 5 мин назад) — Пятница молчит.
+  const ownerLastActive = new Map<number, number>(); // chatId → timestamp
+  const ownerStyleSamples = new Map<number, string[]>(); // chatId → последние сообщения владельца
+  const OWNER_ACTIVE_MS = 5 * 60 * 1000; // 5 минут
+
   // Дебаунс для business-сообщений: накапливаем сообщения от одного контакта
   // за 5 секунд и отвечаем одним батчем, а не на каждое по отдельности.
   type BusinessBuffer = {
@@ -653,12 +659,32 @@ function setupBot(cfg: BotConfig): Bot {
     if (!buf) return;
     bizBuffers.delete(chatId);
 
+    // Владелец недавно сам писал в этот чат — молчим
+    const lastActive = ownerLastActive.get(chatId) ?? 0;
+    if (Date.now() - lastActive < OWNER_ACTIVE_MS) return;
+
     const { texts, connectionId, senderName, model } = buf;
     const combined = texts.length === 1
       ? texts[0]!
       : texts.map((t, i) => `${i + 1}. ${t}`).join("\n");
 
-    const systemExtra = `Сейчас ты отвечаешь в личном Telegram-чате владельца вместо него. Собеседника зовут ${senderName}. Пиши от первого лица, коротко и по-человечески — так, как написал бы сам владелец. Без упоминания что ты ИИ или ассистент, если прямо не спросят.`;
+    // Образцы стиля владельца из этого чата (до 10 последних)
+    const samples = ownerStyleSamples.get(chatId) ?? [];
+    const styleBlock = samples.length > 0
+      ? `\n\nПримеры того, как владелец сам пишет в этом чате:\n${samples.slice(-10).map((s) => `«${s}»`).join("\n")}\nКопируй его стиль: заглавные/строчные, знаки препинания, длину фраз, слова — всё.`
+      : "";
+
+    const systemExtra = `Сейчас ты отвечаешь в личном Telegram-чате владельца вместо него.
+
+Собеседника зовут ${senderName}. По имени определи его/её пол и обращайся правильно (он/она, дорогой/дорогая и т.п.).
+
+Пиши ТОЧНО как владелец — это главное:
+— Изучи историю чата: как он сам писал раньше в этом диалоге.
+— Копируй его орфографию, пунктуацию, длину сообщений, любимые слова и обороты.
+— Если он пишет без заглавных — ты тоже. Если коротко — коротко. Если с опечатками — допускай похожие. Если матерится — можешь тоже (в меру). Если вставляет эмодзи — вставляй.
+— Не выдумывай официальных фраз. Отвечай так, будто это пишет живой человек — владелец.${styleBlock}
+
+Не раскрывай что ты ИИ, если прямо не спросят.`;
 
     try {
       const history = await getHistory(chatId);
@@ -722,7 +748,9 @@ function setupBot(cfg: BotConfig): Bot {
       text?: string;
       caption?: string;
       photo?: { file_id: string; file_unique_id: string; width: number; height: number }[];
+      video?: { file_id: string; file_unique_id: string; duration: number; mime_type?: string };
       voice?: { file_id: string; file_path?: string; duration: number };
+      has_media_spoiler?: boolean;
       business_connection_id?: string;
       reply_to_message?: { text?: string; caption?: string; from?: { first_name?: string } };
     } | undefined;
@@ -752,8 +780,17 @@ function setupBot(cfg: BotConfig): Bot {
       }
     }
 
-    // Команда «сохрани» от самого владельца в ответ на чужое сообщение
+    // Сообщение от самого владельца — обновляем активность и собираем стиль
     if (msg.from?.id === cfg.ownerTelegramId) {
+      ownerLastActive.set(chatId, Date.now());
+      // Сохраняем образцы стиля
+      if (msg.text && msg.text.trim().length > 2) {
+        const samples = ownerStyleSamples.get(chatId) ?? [];
+        samples.push(msg.text.trim());
+        if (samples.length > 30) samples.shift();
+        ownerStyleSamples.set(chatId, samples);
+      }
+      // Команда «сохрани» в ответ на чужое сообщение
       const ownerText = msg.text?.trim().toLowerCase() ?? "";
       if (/^(сохрани|зафиксируй|важно|запомни|save)/.test(ownerText) && msg.reply_to_message) {
         const saved = msg.reply_to_message.text || msg.reply_to_message.caption || "[медиа без текста]";
@@ -768,13 +805,14 @@ function setupBot(cfg: BotConfig): Bot {
     const model = await cfg.resolveModel();
     if (model === null) return;
 
-    // Фото — пересылаем владельцу и добавляем в буфер для авто-ответа
+    // Фото (включая одноразовые — has_media_spoiler) — пересылаем владельцу
     if (msg.photo && msg.photo.length > 0) {
       const largest = msg.photo[msg.photo.length - 1]!;
       const caption = msg.caption ? `\n${msg.caption}` : "";
+      const label = msg.has_media_spoiler ? "📷🔐 Одноразовое фото от" : "📷 Фото от";
       void bot.api
         .sendPhoto(cfg.ownerTelegramId, largest.file_id, {
-          caption: `📷 Фото от ${senderName}${caption}`,
+          caption: `${label} ${senderName}${caption}`,
         })
         .catch(() => {});
 
@@ -790,6 +828,35 @@ function setupBot(cfg: BotConfig): Bot {
       } else {
         bizBuffers.set(chatId, {
           texts: [photoNote],
+          timer: setTimeout(() => void flushBizBuffer(chatId), DEBOUNCE_MS),
+          connectionId,
+          senderName,
+          model: model ?? undefined,
+        });
+      }
+      return;
+    }
+
+    // Видео (включая одноразовые) — пересылаем владельцу
+    if (msg.video) {
+      const caption = msg.caption ? `\n${msg.caption}` : "";
+      const label = msg.has_media_spoiler ? "🎥🔐 Одноразовое видео от" : "🎥 Видео от";
+      void bot.api
+        .sendVideo(cfg.ownerTelegramId, msg.video.file_id, {
+          caption: `${label} ${senderName}${caption}`,
+        })
+        .catch(() => {});
+      const videoNote = msg.caption
+        ? `[прислал видео с подписью: ${msg.caption}]`
+        : `[прислал видео]`;
+      const existingV = bizBuffers.get(chatId);
+      if (existingV) {
+        clearTimeout(existingV.timer);
+        existingV.texts.push(videoNote);
+        existingV.timer = setTimeout(() => void flushBizBuffer(chatId), DEBOUNCE_MS);
+      } else {
+        bizBuffers.set(chatId, {
+          texts: [videoNote],
           timer: setTimeout(() => void flushBizBuffer(chatId), DEBOUNCE_MS),
           connectionId,
           senderName,

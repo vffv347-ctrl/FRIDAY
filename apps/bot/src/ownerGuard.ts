@@ -11,7 +11,7 @@ import type { Context, NextFunction } from "grammy";
 export function createOwnerGuard(ownerTelegramId: number) {
   return async (ctx: Context, next: NextFunction): Promise<void> => {
     const upd = ctx.update as unknown as Record<string, unknown>;
-    if (upd.business_connection || upd.business_message || upd.edited_business_message) {
+    if (upd.business_connection || upd.business_message || upd.edited_business_message || upd.deleted_business_messages) {
       await next();
       return;
     }
