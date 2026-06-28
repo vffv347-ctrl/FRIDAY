@@ -390,6 +390,13 @@ const running = new Map<string, { bot: Bot; cfg: BotConfig }>();
 // Маршрутизация напоминаний: ownerTelegramId → бот для отправки.
 const ownerToBot = new Map<number, Bot>();
 
+// Последняя активность владельца в личном чате с ботом.
+// Если < OWNER_ONLINE_MS мс назад — считаем его онлайн и молчим в business-чатах.
+const ownerBotLastActive = new Map<number, number>(); // ownerTelegramId → ms
+const OWNER_ONLINE_MS = 10 * 60 * 1000; // 10 минут
+// Ручная пауза (владелец включил через /pause): FRIDAY не отвечает в чатах совсем.
+const businessManualPause = new Set<number>(); // ownerTelegramId
+
 // ── Автономная (фоновая) глубокая задача ──────────────────────────
 // Запускается когда FRIDAY вызывает инструмент take_deep_task.
 // Выполняется в фоне, результат отправляется в тот же chatId.
@@ -493,6 +500,17 @@ function setupBot(cfg: BotConfig): Bot {
     }
   });
 
+  // Ручное управление business-режимом
+  bot.command("pause", async (ctx) => {
+    businessManualPause.add(cfg.ownerTelegramId);
+    await ctx.reply("Поставила на паузу — не отвечаю в чатах пока не скажешь /resume.");
+  });
+  bot.command("resume", async (ctx) => {
+    businessManualPause.delete(cfg.ownerTelegramId);
+    ownerBotLastActive.delete(cfg.ownerTelegramId); // сбрасываем таймер онлайна
+    await ctx.reply("Вернулась в работу — снова отвечаю в чатах.");
+  });
+
   for (const [key, cmd] of Object.entries(SMART_COMMANDS)) {
     bot.command(key, async (ctx) => {
       const model = await gate(ctx);
@@ -518,6 +536,8 @@ function setupBot(cfg: BotConfig): Bot {
   bot.on("message:text", async (ctx) => {
     const model = await gate(ctx);
     if (model === null) return;
+    // Фиксируем что владелец онлайн → business-чаты будут молчать 10 мин
+    ownerBotLastActive.set(cfg.ownerTelegramId, Date.now());
 
     // Анализ стиля по обычной фразе
     if (/изучи\s+(мой\s+)?стиль|обнови\s+(мой\s+)?стиль|запомни\s+мой\s+стиль/i.test(ctx.message.text)) {
@@ -779,11 +799,19 @@ function setupBot(cfg: BotConfig): Bot {
     if (!buf) return;
     bizBuffers.delete(chatId);
 
-    // Владелец недавно сам писал в этот чат — молчим
+    // Ручная пауза — молчим совсем
+    if (businessManualPause.has(cfg.ownerTelegramId)) return;
+
+    // Владелец онлайн (писал боту < 10 мин назад) — молчим
+    const botActive = ownerBotLastActive.get(cfg.ownerTelegramId) ?? 0;
+    if (Date.now() - botActive < OWNER_ONLINE_MS) return;
+
+    // Владелец недавно сам писал в этот конкретный чат — молчим
     const lastActive = ownerLastActive.get(chatId) ?? 0;
     if (Date.now() - lastActive < OWNER_ACTIVE_MS) return;
 
-    const { texts, connectionId, senderName, model } = buf;
+    // Для бизнес-чатов всегда Haiku — дёшево и достаточно для разговора
+    const { texts, connectionId, senderName } = buf;
     const combined = texts.length === 1
       ? texts[0]!
       : texts.map((t, i) => `${i + 1}. ${t}`).join("\n");
@@ -845,7 +873,7 @@ function setupBot(cfg: BotConfig): Bot {
           },
         },
         {
-          ...(model ? { model } : {}),
+          model: MODEL_LIGHT, // Haiku для бизнес-чатов — дёшево и достаточно
           systemExtra,
           ownerChatId: cfg.ownerTelegramId,
         },
