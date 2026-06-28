@@ -27,6 +27,42 @@ import { readDocument } from "./documents";
 import { popDueReminders } from "./reminders";
 import { initDb, db } from "./db";
 import { SMART_COMMANDS } from "./commands";
+import { upsertFact } from "./memory";
+
+// ── Анализ стиля владельца ────────────────────────────────────────
+async function analyzeAndSaveStyle(ownerTelegramId: number): Promise<string> {
+  // Берём последние сообщения владельца из его прямого чата с Пятницей
+  let rows: { role: string; content: string }[] = [];
+  try {
+    const { data } = await db()
+      .from("bot_messages")
+      .select("role, content")
+      .eq("owner_id", ownerTelegramId)
+      .eq("role", "user")
+      .order("created_at", { ascending: false })
+      .limit(60);
+    rows = data ?? [];
+  } catch (_) { /* ignore */ }
+
+  const userMessages = rows.map((r) => String(r.content)).filter(Boolean).reverse();
+  if (userMessages.length < 3) {
+    return "Маловато сообщений для анализа — пообщайся со мной ещё немного и повтори.";
+  }
+
+  const sample = userMessages.slice(-40).join("\n---\n");
+  const prompt = `Проанализируй стиль написания этого человека на основе его сообщений. Дай КРАТКОЕ (5–8 пунктов) описание его стиля для другого ИИ, который будет писать вместо него:
+
+${sample}
+
+Опиши: использует ли заглавные буквы, знаки препинания, как длинные сообщения, типичные слова/обороты, эмодзи, ошибки/опечатки, неформальность. Только факты, без лишних слов. Формат: список тезисов.`;
+
+  const result = await askFridayOnce("Ты — аналитик стиля текста. Отвечай кратко и по делу.", prompt, {
+    model: MODEL_DEFAULT,
+  });
+
+  await upsertFact(ownerTelegramId, "СТИЛЬ", result);
+  return result;
+}
 
 // ── Буфер сообщений (дебаунс) ────────────────────────────────────
 // Накапливаем все входящие за одну «волну» (пересланные, картинки,
@@ -446,6 +482,17 @@ function setupBot(cfg: BotConfig): Bot {
     await ctx.reply("История разговора очищена 🧹");
   });
 
+  bot.command("mystyle", async (ctx) => {
+    await ctx.replyWithChatAction("typing");
+    try {
+      const result = await analyzeAndSaveStyle(cfg.ownerTelegramId);
+      await sendLong(ctx, `Стиль сохранён и будет использоваться в business-ответах:\n\n${result}`);
+    } catch (err) {
+      console.error("Ошибка анализа стиля:", err);
+      await ctx.reply("Не получилось проанализировать стиль. Попробуй ещё раз.");
+    }
+  });
+
   for (const [key, cmd] of Object.entries(SMART_COMMANDS)) {
     bot.command(key, async (ctx) => {
       const model = await gate(ctx);
@@ -471,6 +518,19 @@ function setupBot(cfg: BotConfig): Bot {
   bot.on("message:text", async (ctx) => {
     const model = await gate(ctx);
     if (model === null) return;
+
+    // Анализ стиля по обычной фразе
+    if (/изучи\s+(мой\s+)?стиль|обнови\s+(мой\s+)?стиль|запомни\s+мой\s+стиль/i.test(ctx.message.text)) {
+      await ctx.replyWithChatAction("typing");
+      try {
+        const result = await analyzeAndSaveStyle(cfg.ownerTelegramId);
+        await sendLong(ctx, `Стиль сохранён:\n\n${result}`);
+      } catch {
+        await ctx.reply("Не получилось проанализировать. Попробуй ещё раз.");
+      }
+      return;
+    }
+
     const isForwarded =
       !!ctx.message.forward_origin ||
       !!(ctx.message as Record<string, unknown>).forward_from;
