@@ -634,8 +634,9 @@ function setupBot(cfg: BotConfig): Bot {
     text?: string;
     caption?: string;
     senderName: string;
-    photoFileId?: string;  // для сохранения одноразовых фото по команде .!
-    videoFileId?: string;  // для сохранения одноразовых видео по команде .!
+    username?: string;     // @username для отображения в уведомлениях
+    photoFileId?: string;
+    videoFileId?: string;
   };
   const bizMsgCache = new Map<string, BizMsgEntry>();
 
@@ -749,7 +750,7 @@ function setupBot(cfg: BotConfig): Bot {
     const upd = ctx.update as unknown as Record<string, unknown>;
     const msg = upd.business_message as {
       message_id?: number;
-      from?: { id: number; first_name?: string; last_name?: string };
+      from?: { id: number; first_name?: string; last_name?: string; username?: string };
       chat: { id: number; type?: string };
       text?: string;
       caption?: string;
@@ -757,6 +758,7 @@ function setupBot(cfg: BotConfig): Bot {
       video?: { file_id: string; file_unique_id: string; duration: number; mime_type?: string };
       voice?: { file_id: string; file_path?: string; duration: number };
       has_media_spoiler?: boolean;
+      has_protected_content?: boolean;
       business_connection_id?: string;
       reply_to_message?: {
         message_id?: number;
@@ -778,6 +780,8 @@ function setupBot(cfg: BotConfig): Bot {
 
     const senderName =
       [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") || "собеседник";
+    const senderUsername = msg.from?.username ? `@${msg.from.username}` : undefined;
+    const senderDisplay = senderUsername ? `${senderName} (${senderUsername})` : senderName;
 
     // Логируем структуру входящего сообщения — для диагностики одноразовых медиа
     const rawMsg = upd.business_message as Record<string, unknown>;
@@ -801,6 +805,7 @@ function setupBot(cfg: BotConfig): Bot {
         text: msg.text || msg.caption,
         caption: msg.caption,
         senderName,
+        username: msg.from?.username,
       };
       if (msg.photo && msg.photo.length > 0) {
         entry.photoFileId = msg.photo[msg.photo.length - 1]!.file_id;
@@ -886,14 +891,22 @@ function setupBot(cfg: BotConfig): Bot {
     const model = await cfg.resolveModel();
     if (model === null) return;
 
+    // Если нет ни текста, ни известного медиа — логируем полный update (one-time photo?)
+    if (!msg.text && !msg.photo && !msg.video && !msg.voice) {
+      console.log(`[biz] неизвестный тип от ${senderDisplay}:`, JSON.stringify(rawMsg).slice(0, 500));
+      void bot.api
+        .sendMessage(cfg.ownerTelegramId, `📨 ${senderDisplay} прислал что-то (возможно одноразовое фото/видео) — Telegram не передаёт боту содержимое таких сообщений`)
+        .catch(() => {});
+    }
+
     // Фото (включая одноразовые — has_media_spoiler) — пересылаем владельцу
     if (msg.photo && msg.photo.length > 0) {
       const largest = msg.photo[msg.photo.length - 1]!;
       const caption = msg.caption ? `\n${msg.caption}` : "";
-      const label = msg.has_media_spoiler ? "📷🔐 Одноразовое фото от" : "📷 Фото от";
+      const label = msg.has_media_spoiler ? "📷🔐 Одноразовое фото от" : `📷 Фото от`;
       void bot.api
         .sendPhoto(cfg.ownerTelegramId, largest.file_id, {
-          caption: `${label} ${senderName}${caption}`,
+          caption: `${label} ${senderDisplay}${caption}`,
         })
         .catch(() => {});
 
@@ -924,7 +937,7 @@ function setupBot(cfg: BotConfig): Bot {
       const label = msg.has_media_spoiler ? "🎥🔐 Одноразовое видео от" : "🎥 Видео от";
       void bot.api
         .sendVideo(cfg.ownerTelegramId, msg.video.file_id, {
-          caption: `${label} ${senderName}${caption}`,
+          caption: `${label} ${senderDisplay}${caption}`,
         })
         .catch(() => {});
       const videoNote = msg.caption
@@ -1022,19 +1035,21 @@ function setupBot(cfg: BotConfig): Bot {
 
     const key = bizCacheKey(msg.chat.id, msg.message_id);
     const cached = bizMsgCache.get(key);
-    const senderName =
-      [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") || "собеседник";
+    const editSenderName =
+      [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") || cached?.senderName || "собеседник";
+    const editUsername = (msg.from as { username?: string } | undefined)?.username;
+    const editDisplay = editUsername ? `${editSenderName} (@${editUsername})` : editSenderName;
     const newText = msg.text || msg.caption || "[медиа]";
 
     let notice: string;
     if (cached?.text && cached.text !== newText) {
-      notice = `✏️ ${senderName} отредактировал сообщение:\n\nБыло: ${cached.text}\nСтало: ${newText}`;
+      notice = `✏️ ${editDisplay} отредактировал:\n\nБыло: ${cached.text}\nСтало: ${newText}`;
     } else {
-      notice = `✏️ ${senderName} отредактировал сообщение:\n${newText}`;
+      notice = `✏️ ${editDisplay} отредактировал:\n${newText}`;
     }
 
     // Обновляем кеш
-    bizMsgCache.set(key, { text: newText, senderName });
+    bizMsgCache.set(key, { text: newText, senderName: editSenderName, username: editUsername });
 
     void bot.api.sendMessage(cfg.ownerTelegramId, notice).catch(() => {});
   });
@@ -1057,7 +1072,8 @@ function setupBot(cfg: BotConfig): Bot {
       const cached = bizMsgCache.get(key);
       if (cached) {
         const content = cached.text || "[медиа без текста]";
-        found.push(`— «${content}» (от ${cached.senderName})`);
+        const who = cached.username ? `${cached.senderName} (@${cached.username})` : cached.senderName;
+        found.push(`— «${content}» (от ${who})`);
         bizMsgCache.delete(key);
       } else {
         notFound.push(msgId);
