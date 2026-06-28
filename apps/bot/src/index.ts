@@ -45,7 +45,7 @@ type ChatBuffer = {
   model: string | undefined;
 };
 
-const DEBOUNCE_MS = 3_000;
+const DEBOUNCE_MS = 5_000;
 const chatBuffers = new Map<number, ChatBuffer>();
 
 function bufferItem(
@@ -175,6 +175,25 @@ async function processBatch(
         onDocument: async (file, filename) => {
           produced = true;
           await ctx.replyWithDocument(new InputFile(file, filename));
+        },
+        onDeepTask: async (confirmationMessage, taskPrompt) => {
+          produced = true;
+          await ctx.reply(clean(confirmationMessage));
+          void executeDeepTask(
+            chatId,
+            taskPrompt,
+            (text) => ctx.api.sendMessage(chatId, text).then(() => {}),
+            (buf, cap) =>
+              ctx.api
+                .sendPhoto(
+                  chatId,
+                  new InputFile(buf, "friday.png"),
+                  cap ? { caption: cap } : undefined,
+                )
+                .then(() => {}),
+            (buf, name) =>
+              ctx.api.sendDocument(chatId, new InputFile(buf, name)).then(() => {}),
+          );
         },
       },
       model ? { model } : undefined,
@@ -334,6 +353,66 @@ const running = new Map<string, { bot: Bot; cfg: BotConfig }>();
 // Маршрутизация напоминаний: ownerTelegramId → бот для отправки.
 const ownerToBot = new Map<number, Bot>();
 
+// ── Автономная (фоновая) глубокая задача ──────────────────────────
+// Запускается когда FRIDAY вызывает инструмент take_deep_task.
+// Выполняется в фоне, результат отправляется в тот же chatId.
+async function executeDeepTask(
+  chatId: number,
+  taskPrompt: string,
+  sendMsg: (text: string) => Promise<void>,
+  sendPhoto: (buf: Buffer, cap: string) => Promise<void>,
+  sendDoc: (buf: Buffer, name: string) => Promise<void>,
+): Promise<void> {
+  try {
+    const result = await runFriday(
+      [{ role: "user" as const, content: taskPrompt }],
+      chatId,
+      {
+        onImage: async (image, caption) => sendPhoto(image, caption),
+        onDocument: async (file, filename) => sendDoc(file, filename),
+      },
+      { deepTask: true, ownerChatId: chatId },
+    );
+
+    if (result) {
+      const out = clean(result);
+      for (let i = 0; i < out.length; i += TELEGRAM_LIMIT) {
+        await sendMsg(out.slice(i, i + TELEGRAM_LIMIT));
+      }
+      await appendAssistant(chatId, result);
+    }
+  } catch (err) {
+    console.error("Ошибка глубокой задачи:", err);
+    await sendMsg(
+      "Что-то пошло не так при выполнении задачи. Попробуй сформулировать её иначе.",
+    ).catch(() => {});
+  }
+}
+
+// ── Извлечение важной инфы из бизнес-чата → в личный чат с ботом ──
+// Запускается в фоне после каждого ответа в business-режиме.
+async function maybeExtractBusinessInfo(
+  senderName: string,
+  incoming: string,
+  fridayReply: string,
+  ownerTelegramId: number,
+  sendToOwner: (text: string) => Promise<void>,
+): Promise<void> {
+  try {
+    const extracted = await askFridayOnce(
+      `Ты анализируешь переписку делового человека. Задача: если в сообщении есть конкретная важная информация (дата / время встречи, сумма / сделка, обязательство, контакт, срочный дедлайн, важная договорённость) — выдай краткое резюме одной строкой. Если ничего важного нет — ответь только словом «нет».`,
+      `Сообщение от ${senderName}: ${incoming}\n\nОтвет: ${fridayReply}`,
+      { model: MODEL_LIGHT },
+    );
+
+    const trimmed = extracted?.trim() ?? "";
+    if (trimmed && !/^нет$/i.test(trimmed)) {
+      await sendToOwner(`📌 Из чата с ${senderName}:\n${trimmed}`);
+    }
+  } catch {
+    // тихо — это фоновая функция
+  }
+}
 
 // ── Конструируем экземпляр бота с обработчиками ────────────────────
 function setupBot(cfg: BotConfig): Bot {
@@ -517,6 +596,128 @@ function setupBot(cfg: BotConfig): Bot {
     await ctx.reply(
       "Этот тип сообщения я пока не освоила. Понимаю текст, голос, картинки и документы.",
     );
+  });
+
+  // ── Telegram Business API ────────────────────────────────────────
+  // Когда бот подключён через Настройки → Business → Автоматизация чатов,
+  // он получает сообщения из личных чатов владельца и может отвечать от его имени.
+
+  bot.on("business_connection" as never, async (ctx: Context) => {
+    const conn = (ctx.update as unknown as Record<string, {id: string; is_enabled: boolean; user: {id: number}}>).business_connection;
+    if (!conn) return;
+    if (conn.is_enabled) {
+      console.log(`🔗 Business-соединение подключено (owner ${cfg.ownerTelegramId}, conn ${conn.id})`);
+    } else {
+      console.log(`🔌 Business-соединение отключено (owner ${cfg.ownerTelegramId})`);
+    }
+  });
+
+  bot.on("business_message" as never, async (ctx: Context) => {
+    const upd = ctx.update as unknown as Record<string, unknown>;
+    const msg = upd.business_message as {
+      from?: { id: number; first_name?: string; last_name?: string };
+      chat: { id: number; type?: string };
+      text?: string;
+      business_connection_id?: string;
+      reply_to_message?: { text?: string; caption?: string; from?: { first_name?: string } };
+    } | undefined;
+    if (!msg) return;
+
+    // Только личные чаты — не отвечаем в группах и каналах
+    const chatType = msg.chat.type ?? "private";
+    if (chatType !== "private") return;
+
+    const chatId = msg.chat.id;
+    const connectionId = msg.business_connection_id;
+    if (!connectionId) return;
+
+    const senderName =
+      [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") || "собеседник";
+
+    // Команда «сохрани» от самого владельца в ответ на чужое сообщение
+    if (msg.from?.id === cfg.ownerTelegramId) {
+      const ownerText = msg.text?.trim().toLowerCase() ?? "";
+      if (/^(сохрани|зафиксируй|важно|запомни|save)/.test(ownerText) && msg.reply_to_message) {
+        const saved =
+          msg.reply_to_message.text ||
+          msg.reply_to_message.caption ||
+          "[медиа без текста]";
+        const from = msg.reply_to_message.from?.first_name ?? senderName;
+        // Отправляем фиксацию в личный чат с ботом (не в business-чат)
+        void ctx.api
+          .sendMessage(
+            cfg.ownerTelegramId,
+            `📌 Сохранено из чата с ${from}:\n${saved}`,
+          )
+          .catch(() => {});
+      }
+      return; // Свои сообщения владельца не обрабатываем дальше
+    }
+
+    const text = msg.text?.trim();
+    if (!text) return;
+
+    const model = await cfg.resolveModel();
+    if (model === null) return;
+
+    ctx.api
+      .sendChatAction(chatId, "typing", { business_connection_id: connectionId } as Record<string, unknown>)
+      .catch(() => {});
+
+    const systemExtra = `Сейчас ты отвечаешь в личном Telegram-чате владельца вместо него. Собеседника зовут ${senderName}. Пиши от первого лица, коротко и по-человечески — так, как написал бы сам владелец. Без упоминания что ты ИИ или ассистент, если прямо не спросят.`;
+
+    try {
+      const history = await getHistory(chatId);
+      await appendUser(chatId, text);
+      const messages: Anthropic.MessageParam[] = [
+        ...history,
+        { role: "user" as const, content: text },
+      ];
+
+      const reply = await runFriday(
+        messages,
+        chatId,
+        {
+          onImage: async (image, caption) => {
+            await ctx.api.sendPhoto(chatId, new InputFile(image, "friday.png"), {
+              ...(caption ? { caption } : {}),
+              business_connection_id: connectionId,
+            } as Record<string, unknown>);
+          },
+          onDocument: async (file, filename) => {
+            await ctx.api.sendDocument(chatId, new InputFile(file, filename), {
+              business_connection_id: connectionId,
+            } as Record<string, unknown>);
+          },
+        },
+        {
+          ...(model ? { model } : {}),
+          systemExtra,
+          ownerChatId: cfg.ownerTelegramId,
+        },
+      );
+
+      await appendAssistant(chatId, reply || "");
+      if (reply) {
+        const out = clean(reply);
+        for (let i = 0; i < out.length; i += TELEGRAM_LIMIT) {
+          await ctx.api.sendMessage(chatId, out.slice(i, i + TELEGRAM_LIMIT), {
+            business_connection_id: connectionId,
+          } as Record<string, unknown>);
+        }
+      }
+
+      // Фоновое извлечение важной инфы → в личный чат с ботом
+      void maybeExtractBusinessInfo(
+        senderName,
+        text,
+        reply || "",
+        cfg.ownerTelegramId,
+        (t) => ctx.api.sendMessage(cfg.ownerTelegramId, t).then(() => {}),
+      );
+    } catch (err) {
+      console.error("Ошибка business_message:", err);
+    }
   });
 
   bot.catch((err) => {
