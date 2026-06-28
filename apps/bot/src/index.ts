@@ -779,6 +779,22 @@ function setupBot(cfg: BotConfig): Bot {
     const senderName =
       [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") || "собеседник";
 
+    // Логируем структуру входящего сообщения — для диагностики одноразовых медиа
+    const rawMsg = upd.business_message as Record<string, unknown>;
+    const knownFields = ["text", "photo", "video", "voice", "document", "sticker",
+      "animation", "video_note", "audio", "caption", "has_media_spoiler",
+      "has_protected_content", "forward_origin", "story"];
+    const presentFields = knownFields.filter((f) => rawMsg[f] !== undefined);
+    if (presentFields.length > 0 || !rawMsg.text) {
+      console.log(`[biz] msg from ${senderName} chatId=${chatId} fields:`, presentFields, {
+        has_media_spoiler: rawMsg.has_media_spoiler,
+        has_protected_content: rawMsg.has_protected_content,
+        photo: Array.isArray(rawMsg.photo) ? `${(rawMsg.photo as unknown[]).length} sizes` : rawMsg.photo,
+        video: rawMsg.video ? "present" : undefined,
+        story: rawMsg.story ? JSON.stringify(rawMsg.story) : undefined,
+      });
+    }
+
     // Сохраняем в кеш — для удалённых/отред. и сохранения медиа по команде .!
     if (msg.message_id) {
       const entry: BizMsgEntry = {
@@ -791,6 +807,11 @@ function setupBot(cfg: BotConfig): Bot {
       }
       if (msg.video) {
         entry.videoFileId = msg.video.file_id;
+      }
+      // Для video_note (кружочки)
+      const videoNote = (rawMsg.video_note as { file_id?: string } | undefined);
+      if (videoNote?.file_id) {
+        entry.videoFileId = videoNote.file_id;
       }
       bizMsgCache.set(bizCacheKey(chatId, msg.message_id), entry);
       if (bizMsgCache.size > 2000) {
@@ -822,28 +843,31 @@ function setupBot(cfg: BotConfig): Bot {
           : undefined;
         const replyVideoId = replied.video?.file_id;
 
-        // Если в reply нет — берём из кеша (одноразовые медиа приходят без превью)
+        // Берём из кеша (одноразовые медиа приходят без превью в reply_to)
         const cachedEntry = replied.message_id
           ? bizMsgCache.get(bizCacheKey(chatId, replied.message_id))
           : undefined;
+
+        console.log(`[biz .!] replyMsgId=${replied.message_id} replyPhoto=${replyPhotoId} replyVideo=${replyVideoId} cached=${JSON.stringify(cachedEntry)}`);
+
         const photoId = replyPhotoId ?? cachedEntry?.photoFileId;
         const videoId = replyVideoId ?? cachedEntry?.videoFileId;
 
         if (photoId) {
           void bot.api
             .sendPhoto(cfg.ownerTelegramId, photoId, { caption: `📷 Сохранено от ${from}` })
-            .catch(() => {});
+            .catch((e) => console.error("[biz .! sendPhoto]", e));
         } else if (videoId) {
           void bot.api
             .sendVideo(cfg.ownerTelegramId, videoId, { caption: `🎥 Сохранено от ${from}` })
-            .catch(() => {});
+            .catch((e) => console.error("[biz .! sendVideo]", e));
         } else {
           const content = replied.text || replied.caption;
-          if (content) {
-            void bot.api
-              .sendMessage(cfg.ownerTelegramId, `📌 Сохранено от ${from}:\n${content}`)
-              .catch(() => {});
-          }
+          void bot.api
+            .sendMessage(cfg.ownerTelegramId, content
+              ? `📌 Сохранено от ${from}:\n${content}`
+              : `⚠️ Медиа от ${from} недоступно — Telegram не передал одноразовые данные боту`)
+            .catch(() => {});
         }
         return;
       }
