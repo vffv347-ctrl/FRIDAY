@@ -628,9 +628,15 @@ function setupBot(cfg: BotConfig): Bot {
     }
   });
 
-  // Кеш входящих business-сообщений — нужен для показа удалённых/отредактированных.
+  // Кеш входящих business-сообщений — нужен для удалённых/отред. и сохранения медиа.
   // Ключ: `${chatId}:${messageId}`
-  type BizMsgEntry = { text?: string; caption?: string; senderName: string };
+  type BizMsgEntry = {
+    text?: string;
+    caption?: string;
+    senderName: string;
+    photoFileId?: string;  // для сохранения одноразовых фото по команде .!
+    videoFileId?: string;  // для сохранения одноразовых видео по команде .!
+  };
   const bizMsgCache = new Map<string, BizMsgEntry>();
 
   function bizCacheKey(chatId: number, msgId: number): string {
@@ -752,7 +758,14 @@ function setupBot(cfg: BotConfig): Bot {
       voice?: { file_id: string; file_path?: string; duration: number };
       has_media_spoiler?: boolean;
       business_connection_id?: string;
-      reply_to_message?: { text?: string; caption?: string; from?: { first_name?: string } };
+      reply_to_message?: {
+        message_id?: number;
+        text?: string;
+        caption?: string;
+        from?: { first_name?: string };
+        photo?: { file_id: string; width: number; height: number }[];
+        video?: { file_id: string };
+      };
     } | undefined;
     if (!msg) return;
 
@@ -766,14 +779,20 @@ function setupBot(cfg: BotConfig): Bot {
     const senderName =
       [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") || "собеседник";
 
-    // Сохраняем в кеш для последующего показа удалённых/отредактированных
+    // Сохраняем в кеш — для удалённых/отред. и сохранения медиа по команде .!
     if (msg.message_id) {
-      bizMsgCache.set(bizCacheKey(chatId, msg.message_id), {
+      const entry: BizMsgEntry = {
         text: msg.text || msg.caption,
         caption: msg.caption,
         senderName,
-      });
-      // Ограничиваем размер кеша
+      };
+      if (msg.photo && msg.photo.length > 0) {
+        entry.photoFileId = msg.photo[msg.photo.length - 1]!.file_id;
+      }
+      if (msg.video) {
+        entry.videoFileId = msg.video.file_id;
+      }
+      bizMsgCache.set(bizCacheKey(chatId, msg.message_id), entry);
       if (bizMsgCache.size > 2000) {
         const firstKey = bizMsgCache.keys().next().value as string;
         bizMsgCache.delete(firstKey);
@@ -790,9 +809,47 @@ function setupBot(cfg: BotConfig): Bot {
         if (samples.length > 30) samples.shift();
         ownerStyleSamples.set(chatId, samples);
       }
+      const ownerText = msg.text?.trim() ?? "";
+
+      // Команда .! — сохранить медиа из reply (одноразовое фото/видео)
+      if (/^[.!]+$/.test(ownerText) && msg.reply_to_message) {
+        const replied = msg.reply_to_message;
+        const from = replied.from?.first_name ?? senderName;
+
+        // Пробуем взять file_id из самого reply_to_message (обычные фото)
+        const replyPhotoId = replied.photo && replied.photo.length > 0
+          ? replied.photo[replied.photo.length - 1]!.file_id
+          : undefined;
+        const replyVideoId = replied.video?.file_id;
+
+        // Если в reply нет — берём из кеша (одноразовые медиа приходят без превью)
+        const cachedEntry = replied.message_id
+          ? bizMsgCache.get(bizCacheKey(chatId, replied.message_id))
+          : undefined;
+        const photoId = replyPhotoId ?? cachedEntry?.photoFileId;
+        const videoId = replyVideoId ?? cachedEntry?.videoFileId;
+
+        if (photoId) {
+          void bot.api
+            .sendPhoto(cfg.ownerTelegramId, photoId, { caption: `📷 Сохранено от ${from}` })
+            .catch(() => {});
+        } else if (videoId) {
+          void bot.api
+            .sendVideo(cfg.ownerTelegramId, videoId, { caption: `🎥 Сохранено от ${from}` })
+            .catch(() => {});
+        } else {
+          const content = replied.text || replied.caption;
+          if (content) {
+            void bot.api
+              .sendMessage(cfg.ownerTelegramId, `📌 Сохранено от ${from}:\n${content}`)
+              .catch(() => {});
+          }
+        }
+        return;
+      }
+
       // Команда «сохрани» в ответ на чужое сообщение
-      const ownerText = msg.text?.trim().toLowerCase() ?? "";
-      if (/^(сохрани|зафиксируй|важно|запомни|save)/.test(ownerText) && msg.reply_to_message) {
+      if (/^(сохрани|зафиксируй|важно|запомни|save)/i.test(ownerText) && msg.reply_to_message) {
         const saved = msg.reply_to_message.text || msg.reply_to_message.caption || "[медиа без текста]";
         const from = msg.reply_to_message.from?.first_name ?? senderName;
         void bot.api
