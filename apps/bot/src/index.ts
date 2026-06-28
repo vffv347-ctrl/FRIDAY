@@ -684,10 +684,62 @@ function setupBot(cfg: BotConfig): Bot {
     if (!conn) return;
     if (conn.is_enabled) {
       console.log(`🔗 Business-соединение подключено (owner ${cfg.ownerTelegramId}, conn ${conn.id})`);
+      // Восстанавливаем кеш полов из долговременной памяти
+      try {
+        const { getFacts } = await import("./memory");
+        const facts = await getFacts(cfg.ownerTelegramId);
+        for (const fact of facts) {
+          const m = fact.match(/^\[КОНТАКТ:(\d+)\].*Пол:\s*(женский|мужской)/i);
+          if (m) {
+            const cid = Number(m[1]);
+            contactGenderCache.set(cid, m[2]?.toLowerCase() === "женский" ? "female" : "male");
+          }
+        }
+      } catch { /* ignore */ }
     } else {
       console.log(`🔌 Business-соединение отключено (owner ${cfg.ownerTelegramId})`);
     }
   });
+
+  // Пол контакта — определяем один раз, кешируем и сохраняем в память.
+  type Gender = "male" | "female" | "unknown";
+  const contactGenderCache = new Map<number, Gender>();
+
+  function guessGenderByName(name: string): Gender {
+    const first = name.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
+    if (!first) return "unknown";
+    if (/[аяь]$/.test(first)) return "female";
+    if (/[йн]$|ий$|ей$/.test(first)) return "male";
+    return "unknown";
+  }
+
+  async function resolveGender(chatId: number, senderName: string, texts: string[]): Promise<Gender> {
+    const cached = contactGenderCache.get(chatId);
+    if (cached) return cached;
+
+    let gender = guessGenderByName(senderName);
+
+    // Если имя не даёт ответа — спрашиваем Claude (дёшево, на Haiku)
+    if (gender === "unknown") {
+      try {
+        const sample = texts.slice(0, 3).join("\n");
+        const answer = await askFridayOnce(
+          "Ты определяешь пол человека. Отвечай одним словом: женский или мужской.",
+          `Имя: «${senderName}». Примеры сообщений:\n${sample || "(нет текста)"}`,
+          { model: MODEL_LIGHT },
+        );
+        if (/женск/i.test(answer)) gender = "female";
+        else if (/мужск/i.test(answer)) gender = "male";
+      } catch { /* оставляем unknown */ }
+    }
+
+    contactGenderCache.set(chatId, gender);
+    if (gender !== "unknown") {
+      const label = gender === "female" ? "женский" : "мужской";
+      void upsertFact(cfg.ownerTelegramId, `КОНТАКТ:${chatId}`, `Имя: ${senderName}, Пол: ${label}`).catch(() => {});
+    }
+    return gender;
+  }
 
   // Кеш входящих business-сообщений — нужен для удалённых/отред. и сохранения медиа.
   // Ключ: `${chatId}:${messageId}`
@@ -736,6 +788,15 @@ function setupBot(cfg: BotConfig): Bot {
       ? texts[0]!
       : texts.map((t, i) => `${i + 1}. ${t}`).join("\n");
 
+    // Определяем пол контакта
+    const gender = await resolveGender(chatId, senderName, texts);
+    const genderNote =
+      gender === "female"
+        ? `женского пола — обращайся к НЕЙ строго в женском роде: «ты написала», «ты сделала», «дорогая», «рада» и т.п. НИКОГДА не используй мужской род`
+        : gender === "male"
+        ? `мужского пола — обращайся к НЕМУ в мужском роде`
+        : `пол неизвестен — определи по контексту переписки и обращайся соответственно`;
+
     // Образцы стиля владельца из этого чата (до 10 последних)
     const samples = ownerStyleSamples.get(chatId) ?? [];
     const styleBlock = samples.length > 0
@@ -744,7 +805,7 @@ function setupBot(cfg: BotConfig): Bot {
 
     const systemExtra = `Сейчас ты отвечаешь в личном Telegram-чате владельца вместо него.
 
-Собеседника зовут ${senderName}. По имени определи его/её пол и обращайся правильно (он/она, дорогой/дорогая и т.п.).
+Собеседника зовут ${senderName}, ${genderNote}.
 
 Пиши ТОЧНО как владелец — это главное:
 — Изучи историю чата: как он сам писал раньше в этом диалоге.
