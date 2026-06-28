@@ -501,6 +501,22 @@ function setupBot(cfg: BotConfig): Bot {
         await ctx.reply("Не разобрала голосовое — повтори, пожалуйста?");
         return;
       }
+
+      const isForwardedVoice =
+        !!ctx.message.forward_origin ||
+        !!(ctx.message as Record<string, unknown>).forward_from;
+
+      if (isForwardedVoice) {
+        // Чужое голосовое — просто транскрипция, без анализа
+        const chatId = ctx.chat.id;
+        await appendUser(chatId, "[пересланное голосовое]");
+        const reply = `Текст голосового:\n\n${text}`;
+        await appendAssistant(chatId, reply);
+        await sendLong(ctx, reply);
+        return;
+      }
+
+      // Своё голосовое — в буфер, FRIDAY разберётся по контексту
       bufferItem(ctx, ctx.chat.id, { type: "voice", text }, model ?? undefined);
     } catch (err) {
       console.error("Ошибка обработки голосового:", err);
