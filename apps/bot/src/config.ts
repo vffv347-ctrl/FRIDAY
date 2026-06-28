@@ -7,6 +7,7 @@ export type Config = {
   supabaseUrl: string;
   supabaseSecretKey: string;
   ownerTelegramId: number;
+  notifyGroupId: number | null; // группа для уведомлений business-режима
 };
 
 function required(name: string): string {
@@ -31,6 +32,9 @@ export function loadConfig(): Config {
     process.exit(1);
   }
 
+  const notifyGroupRaw = process.env.NOTIFY_GROUP_ID;
+  const notifyGroupId = notifyGroupRaw ? Number(notifyGroupRaw) : null;
+
   return {
     telegramToken: required("TELEGRAM_BOT_TOKEN"),
     anthropicApiKey: required("ANTHROPIC_API_KEY"),
@@ -38,5 +42,6 @@ export function loadConfig(): Config {
     supabaseUrl: required("SUPABASE_URL"),
     supabaseSecretKey: required("SUPABASE_SECRET_KEY"),
     ownerTelegramId,
+    notifyGroupId,
   };
 }

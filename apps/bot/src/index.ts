@@ -343,6 +343,7 @@ async function fetchSubInfo(userId: string): Promise<SubInfo> {
 type BotConfig = {
   token: string;
   ownerTelegramId: number;
+  notifyChatId: number; // куда слать уведомления business-режима (группа или лс)
   userId: string | null; // null = владелец из env
   openaiKey: string;
   resolveModel: () => Promise<string | null | undefined>;
@@ -739,7 +740,7 @@ function setupBot(cfg: BotConfig): Bot {
         combined,
         reply || "",
         cfg.ownerTelegramId,
-        (t) => bot.api.sendMessage(cfg.ownerTelegramId, t).then(() => {}),
+        (t) => bot.api.sendMessage(cfg.notifyChatId, t).then(() => {}),
       );
     } catch (err) {
       console.error("Ошибка business flush:", err);
@@ -860,16 +861,16 @@ function setupBot(cfg: BotConfig): Bot {
 
         if (photoId) {
           void bot.api
-            .sendPhoto(cfg.ownerTelegramId, photoId, { caption: `📷 Сохранено от ${from}` })
+            .sendPhoto(cfg.notifyChatId, photoId, { caption: `📷 Сохранено от ${from}` })
             .catch((e) => console.error("[biz .! sendPhoto]", e));
         } else if (videoId) {
           void bot.api
-            .sendVideo(cfg.ownerTelegramId, videoId, { caption: `🎥 Сохранено от ${from}` })
+            .sendVideo(cfg.notifyChatId, videoId, { caption: `🎥 Сохранено от ${from}` })
             .catch((e) => console.error("[biz .! sendVideo]", e));
         } else {
           const content = replied.text || replied.caption;
           void bot.api
-            .sendMessage(cfg.ownerTelegramId, content
+            .sendMessage(cfg.notifyChatId, content
               ? `📌 Сохранено от ${from}:\n${content}`
               : `⚠️ Медиа от ${from} недоступно — Telegram не передал одноразовые данные боту`)
             .catch(() => {});
@@ -882,7 +883,7 @@ function setupBot(cfg: BotConfig): Bot {
         const saved = msg.reply_to_message.text || msg.reply_to_message.caption || "[медиа без текста]";
         const from = msg.reply_to_message.from?.first_name ?? senderName;
         void bot.api
-          .sendMessage(cfg.ownerTelegramId, `📌 Сохранено из чата с ${from}:\n${saved}`)
+          .sendMessage(cfg.notifyChatId, `📌 Сохранено из чата с ${from}:\n${saved}`)
           .catch(() => {});
       }
       return;
@@ -895,7 +896,7 @@ function setupBot(cfg: BotConfig): Bot {
     if (!msg.text && !msg.photo && !msg.video && !msg.voice) {
       console.log(`[biz] неизвестный тип от ${senderDisplay}:`, JSON.stringify(rawMsg).slice(0, 500));
       void bot.api
-        .sendMessage(cfg.ownerTelegramId, `📨 ${senderDisplay} прислал что-то (возможно одноразовое фото/видео) — Telegram не передаёт боту содержимое таких сообщений`)
+        .sendMessage(cfg.notifyChatId, `📨 ${senderDisplay} прислал что-то (возможно одноразовое фото/видео) — Telegram не передаёт боту содержимое таких сообщений`)
         .catch(() => {});
     }
 
@@ -905,7 +906,7 @@ function setupBot(cfg: BotConfig): Bot {
       const caption = msg.caption ? `\n${msg.caption}` : "";
       const label = msg.has_media_spoiler ? "📷🔐 Одноразовое фото от" : `📷 Фото от`;
       void bot.api
-        .sendPhoto(cfg.ownerTelegramId, largest.file_id, {
+        .sendPhoto(cfg.notifyChatId, largest.file_id, {
           caption: `${label} ${senderDisplay}${caption}`,
         })
         .catch(() => {});
@@ -936,7 +937,7 @@ function setupBot(cfg: BotConfig): Bot {
       const caption = msg.caption ? `\n${msg.caption}` : "";
       const label = msg.has_media_spoiler ? "🎥🔐 Одноразовое видео от" : "🎥 Видео от";
       void bot.api
-        .sendVideo(cfg.ownerTelegramId, msg.video.file_id, {
+        .sendVideo(cfg.notifyChatId, msg.video.file_id, {
           caption: `${label} ${senderDisplay}${caption}`,
         })
         .catch(() => {});
@@ -971,7 +972,7 @@ function setupBot(cfg: BotConfig): Bot {
           if (transcribed) {
             const note = `[голосовое: ${transcribed}]`;
             void bot.api
-              .sendMessage(cfg.ownerTelegramId, `🎙 Голосовое от ${senderName}:\n${transcribed}`)
+              .sendMessage(cfg.notifyChatId, `🎙 Голосовое от ${senderName}:\n${transcribed}`)
               .catch(() => {});
             const existing = bizBuffers.get(chatId);
             if (existing) {
@@ -1051,7 +1052,7 @@ function setupBot(cfg: BotConfig): Bot {
     // Обновляем кеш
     bizMsgCache.set(key, { text: newText, senderName: editSenderName, username: editUsername });
 
-    void bot.api.sendMessage(cfg.ownerTelegramId, notice).catch(() => {});
+    void bot.api.sendMessage(cfg.notifyChatId, notice).catch(() => {});
   });
 
   // Удалённые сообщения — показываем владельцу что было удалено
@@ -1082,10 +1083,10 @@ function setupBot(cfg: BotConfig): Bot {
 
     if (found.length > 0) {
       const notice = `🗑 Удалено ${found.length} сообщ.:\n${found.join("\n")}`;
-      void bot.api.sendMessage(cfg.ownerTelegramId, notice).catch(() => {});
+      void bot.api.sendMessage(cfg.notifyChatId, notice).catch(() => {});
     } else if (notFound.length > 0) {
       void bot.api
-        .sendMessage(cfg.ownerTelegramId, `🗑 Удалено ${notFound.length} сообщ. (не успела сохранить — пришли до запуска бота)`)
+        .sendMessage(cfg.notifyChatId, `🗑 Удалено ${notFound.length} сообщ. (не успела сохранить — пришли до запуска бота)`)
         .catch(() => {});
     }
   });
@@ -1174,6 +1175,7 @@ async function sendBriefingFor(
 async function syncSupervisor(envBot: {
   token: string;
   ownerTelegramId: number;
+  notifyGroupId: number | null;
   openaiKey: string;
 }): Promise<void> {
   // 1. Бот владельца из env — поднимаем один раз и не трогаем.
@@ -1181,6 +1183,7 @@ async function syncSupervisor(envBot: {
     const cfg: BotConfig = {
       token: envBot.token,
       ownerTelegramId: envBot.ownerTelegramId,
+      notifyChatId: envBot.notifyGroupId ?? envBot.ownerTelegramId,
       userId: null,
       openaiKey: envBot.openaiKey,
       // У владельца движок выбирает friday.ts: Sonnet + Opus по триггеру.
@@ -1240,6 +1243,7 @@ async function syncSupervisor(envBot: {
     const cfg: BotConfig = {
       token,
       ownerTelegramId: ownerTg,
+      notifyChatId: envBot.notifyGroupId ?? ownerTg,
       userId,
       openaiKey: envBot.openaiKey,
       resolveModel: async () => {
@@ -1292,6 +1296,7 @@ function main(): void {
   const envBot = {
     token: config.telegramToken,
     ownerTelegramId: config.ownerTelegramId,
+    notifyGroupId: config.notifyGroupId,
     openaiKey: config.openaiApiKey,
   };
 
