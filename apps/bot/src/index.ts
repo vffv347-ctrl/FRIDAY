@@ -612,6 +612,82 @@ function setupBot(cfg: BotConfig): Bot {
     }
   });
 
+  // Дебаунс для business-сообщений: накапливаем сообщения от одного контакта
+  // за 5 секунд и отвечаем одним батчем, а не на каждое по отдельности.
+  type BusinessBuffer = {
+    texts: string[];
+    timer: ReturnType<typeof setTimeout>;
+    connectionId: string;
+    senderName: string;
+    model: string | undefined;
+  };
+  const bizBuffers = new Map<number, BusinessBuffer>();
+
+  async function flushBizBuffer(chatId: number): Promise<void> {
+    const buf = bizBuffers.get(chatId);
+    if (!buf) return;
+    bizBuffers.delete(chatId);
+
+    const { texts, connectionId, senderName, model } = buf;
+    const combined = texts.length === 1
+      ? texts[0]!
+      : texts.map((t, i) => `${i + 1}. ${t}`).join("\n");
+
+    const systemExtra = `Сейчас ты отвечаешь в личном Telegram-чате владельца вместо него. Собеседника зовут ${senderName}. Пиши от первого лица, коротко и по-человечески — так, как написал бы сам владелец. Без упоминания что ты ИИ или ассистент, если прямо не спросят.`;
+
+    try {
+      const history = await getHistory(chatId);
+      await appendUser(chatId, combined);
+      const messages: Anthropic.MessageParam[] = [
+        ...history,
+        { role: "user" as const, content: combined },
+      ];
+
+      const reply = await runFriday(
+        messages,
+        chatId,
+        {
+          onImage: async (image, caption) => {
+            await bot.api.sendPhoto(chatId, new InputFile(image, "friday.png"), {
+              ...(caption ? { caption } : {}),
+              business_connection_id: connectionId,
+            } as Record<string, unknown>);
+          },
+          onDocument: async (file, filename) => {
+            await bot.api.sendDocument(chatId, new InputFile(file, filename), {
+              business_connection_id: connectionId,
+            } as Record<string, unknown>);
+          },
+        },
+        {
+          ...(model ? { model } : {}),
+          systemExtra,
+          ownerChatId: cfg.ownerTelegramId,
+        },
+      );
+
+      await appendAssistant(chatId, reply || "");
+      if (reply) {
+        const out = clean(reply);
+        for (let i = 0; i < out.length; i += TELEGRAM_LIMIT) {
+          await bot.api.sendMessage(chatId, out.slice(i, i + TELEGRAM_LIMIT), {
+            business_connection_id: connectionId,
+          } as Record<string, unknown>);
+        }
+      }
+
+      void maybeExtractBusinessInfo(
+        senderName,
+        combined,
+        reply || "",
+        cfg.ownerTelegramId,
+        (t) => bot.api.sendMessage(cfg.ownerTelegramId, t).then(() => {}),
+      );
+    } catch (err) {
+      console.error("Ошибка business flush:", err);
+    }
+  }
+
   bot.on("business_message" as never, async (ctx: Context) => {
     const upd = ctx.update as unknown as Record<string, unknown>;
     const msg = upd.business_message as {
@@ -623,7 +699,7 @@ function setupBot(cfg: BotConfig): Bot {
     } | undefined;
     if (!msg) return;
 
-    // Только личные чаты — не отвечаем в группах и каналах
+    // Только личные чаты — группы и каналы игнорируем
     const chatType = msg.chat.type ?? "private";
     if (chatType !== "private") return;
 
@@ -643,15 +719,11 @@ function setupBot(cfg: BotConfig): Bot {
           msg.reply_to_message.caption ||
           "[медиа без текста]";
         const from = msg.reply_to_message.from?.first_name ?? senderName;
-        // Отправляем фиксацию в личный чат с ботом (не в business-чат)
         void ctx.api
-          .sendMessage(
-            cfg.ownerTelegramId,
-            `📌 Сохранено из чата с ${from}:\n${saved}`,
-          )
+          .sendMessage(cfg.ownerTelegramId, `📌 Сохранено из чата с ${from}:\n${saved}`)
           .catch(() => {});
       }
-      return; // Свои сообщения владельца не обрабатываем дальше
+      return;
     }
 
     const text = msg.text?.trim();
@@ -660,63 +732,25 @@ function setupBot(cfg: BotConfig): Bot {
     const model = await cfg.resolveModel();
     if (model === null) return;
 
+    // Показываем «печатает» сразу
     ctx.api
       .sendChatAction(chatId, "typing", { business_connection_id: connectionId } as Record<string, unknown>)
       .catch(() => {});
 
-    const systemExtra = `Сейчас ты отвечаешь в личном Telegram-чате владельца вместо него. Собеседника зовут ${senderName}. Пиши от первого лица, коротко и по-человечески — так, как написал бы сам владелец. Без упоминания что ты ИИ или ассистент, если прямо не спросят.`;
-
-    try {
-      const history = await getHistory(chatId);
-      await appendUser(chatId, text);
-      const messages: Anthropic.MessageParam[] = [
-        ...history,
-        { role: "user" as const, content: text },
-      ];
-
-      const reply = await runFriday(
-        messages,
-        chatId,
-        {
-          onImage: async (image, caption) => {
-            await ctx.api.sendPhoto(chatId, new InputFile(image, "friday.png"), {
-              ...(caption ? { caption } : {}),
-              business_connection_id: connectionId,
-            } as Record<string, unknown>);
-          },
-          onDocument: async (file, filename) => {
-            await ctx.api.sendDocument(chatId, new InputFile(file, filename), {
-              business_connection_id: connectionId,
-            } as Record<string, unknown>);
-          },
-        },
-        {
-          ...(model ? { model } : {}),
-          systemExtra,
-          ownerChatId: cfg.ownerTelegramId,
-        },
-      );
-
-      await appendAssistant(chatId, reply || "");
-      if (reply) {
-        const out = clean(reply);
-        for (let i = 0; i < out.length; i += TELEGRAM_LIMIT) {
-          await ctx.api.sendMessage(chatId, out.slice(i, i + TELEGRAM_LIMIT), {
-            business_connection_id: connectionId,
-          } as Record<string, unknown>);
-        }
-      }
-
-      // Фоновое извлечение важной инфы → в личный чат с ботом
-      void maybeExtractBusinessInfo(
+    // Дебаунс: добавляем в буфер, сбрасываем таймер
+    const existing = bizBuffers.get(chatId);
+    if (existing) {
+      clearTimeout(existing.timer);
+      existing.texts.push(text);
+      existing.timer = setTimeout(() => void flushBizBuffer(chatId), DEBOUNCE_MS);
+    } else {
+      bizBuffers.set(chatId, {
+        texts: [text],
+        timer: setTimeout(() => void flushBizBuffer(chatId), DEBOUNCE_MS),
+        connectionId,
         senderName,
-        text,
-        reply || "",
-        cfg.ownerTelegramId,
-        (t) => ctx.api.sendMessage(cfg.ownerTelegramId, t).then(() => {}),
-      );
-    } catch (err) {
-      console.error("Ошибка business_message:", err);
+        model: model ?? undefined,
+      });
     }
   });
 
