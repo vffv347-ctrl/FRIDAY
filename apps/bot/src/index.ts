@@ -628,6 +628,15 @@ function setupBot(cfg: BotConfig): Bot {
     }
   });
 
+  // Кеш входящих business-сообщений — нужен для показа удалённых/отредактированных.
+  // Ключ: `${chatId}:${messageId}`
+  type BizMsgEntry = { text?: string; caption?: string; senderName: string };
+  const bizMsgCache = new Map<string, BizMsgEntry>();
+
+  function bizCacheKey(chatId: number, msgId: number): string {
+    return `${chatId}:${msgId}`;
+  }
+
   // Дебаунс для business-сообщений: накапливаем сообщения от одного контакта
   // за 5 секунд и отвечаем одним батчем, а не на каждое по отдельности.
   type BusinessBuffer = {
@@ -707,15 +716,18 @@ function setupBot(cfg: BotConfig): Bot {
   bot.on("business_message" as never, async (ctx: Context) => {
     const upd = ctx.update as unknown as Record<string, unknown>;
     const msg = upd.business_message as {
+      message_id?: number;
       from?: { id: number; first_name?: string; last_name?: string };
       chat: { id: number; type?: string };
       text?: string;
+      caption?: string;
+      photo?: { file_id: string; file_unique_id: string; width: number; height: number }[];
+      voice?: { file_id: string; file_path?: string; duration: number };
       business_connection_id?: string;
       reply_to_message?: { text?: string; caption?: string; from?: { first_name?: string } };
     } | undefined;
     if (!msg) return;
 
-    // Только личные чаты — группы и каналы игнорируем
     const chatType = msg.chat.type ?? "private";
     if (chatType !== "private") return;
 
@@ -726,18 +738,98 @@ function setupBot(cfg: BotConfig): Bot {
     const senderName =
       [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") || "собеседник";
 
+    // Сохраняем в кеш для последующего показа удалённых/отредактированных
+    if (msg.message_id) {
+      bizMsgCache.set(bizCacheKey(chatId, msg.message_id), {
+        text: msg.text || msg.caption,
+        caption: msg.caption,
+        senderName,
+      });
+      // Ограничиваем размер кеша
+      if (bizMsgCache.size > 2000) {
+        const firstKey = bizMsgCache.keys().next().value as string;
+        bizMsgCache.delete(firstKey);
+      }
+    }
+
     // Команда «сохрани» от самого владельца в ответ на чужое сообщение
     if (msg.from?.id === cfg.ownerTelegramId) {
       const ownerText = msg.text?.trim().toLowerCase() ?? "";
       if (/^(сохрани|зафиксируй|важно|запомни|save)/.test(ownerText) && msg.reply_to_message) {
-        const saved =
-          msg.reply_to_message.text ||
-          msg.reply_to_message.caption ||
-          "[медиа без текста]";
+        const saved = msg.reply_to_message.text || msg.reply_to_message.caption || "[медиа без текста]";
         const from = msg.reply_to_message.from?.first_name ?? senderName;
-        void ctx.api
+        void bot.api
           .sendMessage(cfg.ownerTelegramId, `📌 Сохранено из чата с ${from}:\n${saved}`)
           .catch(() => {});
+      }
+      return;
+    }
+
+    const model = await cfg.resolveModel();
+    if (model === null) return;
+
+    // Фото — пересылаем владельцу и добавляем в буфер для авто-ответа
+    if (msg.photo && msg.photo.length > 0) {
+      const largest = msg.photo[msg.photo.length - 1]!;
+      const caption = msg.caption ? `\n${msg.caption}` : "";
+      void bot.api
+        .sendPhoto(cfg.ownerTelegramId, largest.file_id, {
+          caption: `📷 Фото от ${senderName}${caption}`,
+        })
+        .catch(() => {});
+
+      // Добавляем в буфер как контекст для ответа
+      const photoNote = msg.caption
+        ? `[прислал фото с подписью: ${msg.caption}]`
+        : `[прислал фото]`;
+      const existing = bizBuffers.get(chatId);
+      if (existing) {
+        clearTimeout(existing.timer);
+        existing.texts.push(photoNote);
+        existing.timer = setTimeout(() => void flushBizBuffer(chatId), DEBOUNCE_MS);
+      } else {
+        bizBuffers.set(chatId, {
+          texts: [photoNote],
+          timer: setTimeout(() => void flushBizBuffer(chatId), DEBOUNCE_MS),
+          connectionId,
+          senderName,
+          model: model ?? undefined,
+        });
+      }
+      return;
+    }
+
+    // Голосовое — транскрибируем и добавляем в буфер
+    if (msg.voice && cfg.openaiKey) {
+      try {
+        const file = await bot.api.getFile(msg.voice.file_id);
+        if (file.file_path) {
+          const url = `https://api.telegram.org/file/bot${cfg.token}/${file.file_path}`;
+          const audio = Buffer.from(await (await fetch(url)).arrayBuffer());
+          const transcribed = await transcribeVoice(audio, cfg.openaiKey);
+          if (transcribed) {
+            const note = `[голосовое: ${transcribed}]`;
+            void bot.api
+              .sendMessage(cfg.ownerTelegramId, `🎙 Голосовое от ${senderName}:\n${transcribed}`)
+              .catch(() => {});
+            const existing = bizBuffers.get(chatId);
+            if (existing) {
+              clearTimeout(existing.timer);
+              existing.texts.push(note);
+              existing.timer = setTimeout(() => void flushBizBuffer(chatId), DEBOUNCE_MS);
+            } else {
+              bizBuffers.set(chatId, {
+                texts: [note],
+                timer: setTimeout(() => void flushBizBuffer(chatId), DEBOUNCE_MS),
+                connectionId,
+                senderName,
+                model: model ?? undefined,
+              });
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Ошибка транскрибации голосового в business:", err);
       }
       return;
     }
@@ -745,15 +837,10 @@ function setupBot(cfg: BotConfig): Bot {
     const text = msg.text?.trim();
     if (!text) return;
 
-    const model = await cfg.resolveModel();
-    if (model === null) return;
-
-    // Показываем «печатает» сразу
     ctx.api
       .sendChatAction(chatId, "typing", { business_connection_id: connectionId } as Record<string, unknown>)
       .catch(() => {});
 
-    // Дебаунс: добавляем в буфер, сбрасываем таймер
     const existing = bizBuffers.get(chatId);
     if (existing) {
       clearTimeout(existing.timer);
@@ -767,6 +854,75 @@ function setupBot(cfg: BotConfig): Bot {
         senderName,
         model: model ?? undefined,
       });
+    }
+  });
+
+  // Отредактированное сообщение — показываем владельцу что было и что стало
+  bot.on("edited_business_message" as never, async (ctx: Context) => {
+    const upd = ctx.update as unknown as Record<string, unknown>;
+    const msg = upd.edited_business_message as {
+      message_id?: number;
+      from?: { id: number; first_name?: string; last_name?: string };
+      chat: { id: number };
+      text?: string;
+      caption?: string;
+    } | undefined;
+    if (!msg || !msg.message_id) return;
+
+    // Не уведомляем о редактировании собственных сообщений владельца
+    if (msg.from?.id === cfg.ownerTelegramId) return;
+
+    const key = bizCacheKey(msg.chat.id, msg.message_id);
+    const cached = bizMsgCache.get(key);
+    const senderName =
+      [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") || "собеседник";
+    const newText = msg.text || msg.caption || "[медиа]";
+
+    let notice: string;
+    if (cached?.text && cached.text !== newText) {
+      notice = `✏️ ${senderName} отредактировал сообщение:\n\nБыло: ${cached.text}\nСтало: ${newText}`;
+    } else {
+      notice = `✏️ ${senderName} отредактировал сообщение:\n${newText}`;
+    }
+
+    // Обновляем кеш
+    bizMsgCache.set(key, { text: newText, senderName });
+
+    void bot.api.sendMessage(cfg.ownerTelegramId, notice).catch(() => {});
+  });
+
+  // Удалённые сообщения — показываем владельцу что было удалено
+  bot.on("deleted_business_messages" as never, async (ctx: Context) => {
+    const upd = ctx.update as unknown as Record<string, unknown>;
+    const del = upd.deleted_business_messages as {
+      chat: { id: number };
+      message_ids: number[];
+      business_connection_id?: string;
+    } | undefined;
+    if (!del || !del.message_ids?.length) return;
+
+    const found: string[] = [];
+    const notFound: number[] = [];
+
+    for (const msgId of del.message_ids) {
+      const key = bizCacheKey(del.chat.id, msgId);
+      const cached = bizMsgCache.get(key);
+      if (cached) {
+        const content = cached.text || "[медиа без текста]";
+        found.push(`— «${content}» (от ${cached.senderName})`);
+        bizMsgCache.delete(key);
+      } else {
+        notFound.push(msgId);
+      }
+    }
+
+    if (found.length > 0) {
+      const notice = `🗑 Удалено ${found.length} сообщ.:\n${found.join("\n")}`;
+      void bot.api.sendMessage(cfg.ownerTelegramId, notice).catch(() => {});
+    } else if (notFound.length > 0) {
+      void bot.api
+        .sendMessage(cfg.ownerTelegramId, `🗑 Удалено ${notFound.length} сообщ. (не успела сохранить — пришли до запуска бота)`)
+        .catch(() => {});
     }
   });
 
