@@ -390,10 +390,6 @@ const running = new Map<string, { bot: Bot; cfg: BotConfig }>();
 // Маршрутизация напоминаний: ownerTelegramId → бот для отправки.
 const ownerToBot = new Map<number, Bot>();
 
-// Последняя активность владельца в личном чате с ботом.
-// Если < OWNER_ONLINE_MS мс назад — считаем его онлайн и молчим в business-чатах.
-const ownerBotLastActive = new Map<number, number>(); // ownerTelegramId → ms
-const OWNER_ONLINE_MS = 10 * 60 * 1000; // 10 минут
 // Ручная пауза (владелец включил через /pause): FRIDAY не отвечает в чатах совсем.
 const businessManualPause = new Set<number>(); // ownerTelegramId
 
@@ -507,7 +503,6 @@ function setupBot(cfg: BotConfig): Bot {
   });
   bot.command("resume", async (ctx) => {
     businessManualPause.delete(cfg.ownerTelegramId);
-    ownerBotLastActive.delete(cfg.ownerTelegramId); // сбрасываем таймер онлайна
     await ctx.reply("Вернулась в работу — снова отвечаю в чатах.");
   });
 
@@ -536,8 +531,6 @@ function setupBot(cfg: BotConfig): Bot {
   bot.on("message:text", async (ctx) => {
     const model = await gate(ctx);
     if (model === null) return;
-    // Фиксируем что владелец онлайн → business-чаты будут молчать 10 мин
-    ownerBotLastActive.set(cfg.ownerTelegramId, Date.now());
 
     // Анализ стиля по обычной фразе
     if (/изучи\s+(мой\s+)?стиль|обнови\s+(мой\s+)?стиль|запомни\s+мой\s+стиль/i.test(ctx.message.text)) {
@@ -777,11 +770,8 @@ function setupBot(cfg: BotConfig): Bot {
     return `${chatId}:${msgId}`;
   }
 
-  // Когда владелец сам пишет в business-чате — запоминаем время и образцы стиля.
-  // Если он активен в чате (< 5 мин назад) — Пятница молчит.
-  const ownerLastActive = new Map<number, number>(); // chatId → timestamp
+  // Когда владелец сам пишет в business-чате — собираем образцы его стиля.
   const ownerStyleSamples = new Map<number, string[]>(); // chatId → последние сообщения владельца
-  const OWNER_ACTIVE_MS = 5 * 60 * 1000; // 5 минут
 
   // Дебаунс для business-сообщений: накапливаем сообщения от одного контакта
   // за 5 секунд и отвечаем одним батчем, а не на каждое по отдельности.
@@ -801,14 +791,6 @@ function setupBot(cfg: BotConfig): Bot {
 
     // Ручная пауза — молчим совсем
     if (businessManualPause.has(cfg.ownerTelegramId)) return;
-
-    // Владелец онлайн (писал боту < 10 мин назад) — молчим
-    const botActive = ownerBotLastActive.get(cfg.ownerTelegramId) ?? 0;
-    if (Date.now() - botActive < OWNER_ONLINE_MS) return;
-
-    // Владелец недавно сам писал в этот конкретный чат — молчим
-    const lastActive = ownerLastActive.get(chatId) ?? 0;
-    if (Date.now() - lastActive < OWNER_ACTIVE_MS) return;
 
     // Для бизнес-чатов всегда Haiku — дёшево и достаточно для разговора
     const { texts, connectionId, senderName } = buf;
@@ -980,9 +962,8 @@ function setupBot(cfg: BotConfig): Bot {
       }
     }
 
-    // Сообщение от самого владельца — обновляем активность и собираем стиль
+    // Сообщение от самого владельца — собираем образцы стиля
     if (msg.from?.id === cfg.ownerTelegramId) {
-      ownerLastActive.set(chatId, Date.now());
       // Сохраняем образцы стиля
       if (msg.text && msg.text.trim().length > 2) {
         const samples = ownerStyleSamples.get(chatId) ?? [];
