@@ -120,6 +120,15 @@ function thinkingFor(
   return { type: "adaptive" };
 }
 
+// Haiku 4.5 также не поддерживает output_config.effort — падает с 400
+// «This model does not support the effort parameter». Только Sonnet/Opus.
+function effortConfigFor(
+  model: string,
+): { effort: "low" } | undefined {
+  if (model.includes("haiku")) return undefined;
+  return { effort: "low" };
+}
+
 // ── Инструменты F.R.I.D.A.Y. ──────────────────────────────────────
 const TOOLS: Anthropic.Messages.ToolUnion[] = [
   {
@@ -948,13 +957,14 @@ export async function runFriday(
   let containerId: string | undefined;
 
   const thinking = thinkingFor(model);
+  const effortConfig = effortConfigFor(model);
 
   for (let step = 0; step < maxSteps; step++) {
     const response = await client.messages.create({
       model,
       max_tokens: 8000,
       ...(thinking ? { thinking } : {}),
-      output_config: { effort: "low" },
+      ...(effortConfig ? { output_config: effortConfig } : {}),
       system,
       ...(tools ? { tools } : {}),
       messages,
@@ -1016,11 +1026,12 @@ export async function askFridayOnce(
   const model = options.model ?? pickModel(textInUser);
 
   const thinking = thinkingFor(model);
+  const effortConfig = effortConfigFor(model);
   const response = await client.messages.create({
     model,
     max_tokens: 8000,
     ...(thinking ? { thinking } : {}),
-    output_config: { effort: "low" },
+    ...(effortConfig ? { output_config: effortConfig } : {}),
     system: systemBlocks(systemExtra),
     messages: [{ role: "user", content: userContent }],
   });
