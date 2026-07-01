@@ -27,7 +27,7 @@ import { readDocument } from "./documents";
 import { popDueReminders } from "./reminders";
 import { initDb, db } from "./db";
 import { SMART_COMMANDS } from "./commands";
-import { upsertFact } from "./memory";
+import { upsertFact, getFacts } from "./memory";
 
 // ── Анализ стиля владельца ────────────────────────────────────────
 async function analyzeAndSaveStyle(ownerTelegramId: number): Promise<string> {
@@ -699,7 +699,6 @@ function setupBot(cfg: BotConfig): Bot {
       console.log(`🔗 Business-соединение подключено (owner ${cfg.ownerTelegramId}, conn ${conn.id})`);
       // Восстанавливаем кеш полов из долговременной памяти
       try {
-        const { getFacts } = await import("./memory");
         const facts = await getFacts(cfg.ownerTelegramId);
         for (const fact of facts) {
           const m = fact.match(/^\[КОНТАКТ:(\d+)\].*Пол:\s*(женский|мужской)/i);
@@ -750,6 +749,47 @@ function setupBot(cfg: BotConfig): Bot {
     if (gender !== "unknown") {
       const label = gender === "female" ? "женский" : "мужской";
       void upsertFact(cfg.ownerTelegramId, `КОНТАКТ:${chatId}`, `Имя: ${senderName}, Пол: ${label}`).catch(() => {});
+    }
+    return gender;
+  }
+
+  // Пол самого владельца — определяем один раз по имени в Telegram (+ Claude
+  // фолбэком) и кешируем. В business-режиме Пятница говорит ОТ ЛИЦА владельца,
+  // поэтому её базовая персона («женский род») тут не подходит — переопределяем.
+  let ownerGenderCache: Gender | undefined;
+
+  async function resolveOwnerGender(): Promise<Gender> {
+    if (ownerGenderCache) return ownerGenderCache;
+
+    let gender: Gender = "unknown";
+    try {
+      const facts = await getFacts(cfg.ownerTelegramId);
+      const saved = facts.find((f) => f.startsWith("[ПОЛ_ВЛАДЕЛЬЦА]"));
+      const m = saved?.match(/Пол:\s*(женский|мужской)/i);
+      if (m) gender = m[1]?.toLowerCase() === "женский" ? "female" : "male";
+    } catch { /* ignore */ }
+
+    if (gender === "unknown") {
+      try {
+        const chat = await bot.api.getChat(cfg.ownerTelegramId);
+        const firstName = (chat as { first_name?: string }).first_name ?? "";
+        gender = guessGenderByName(firstName);
+        if (gender === "unknown" && firstName) {
+          const answer = await askFridayOnce(
+            "Ты определяешь пол человека по имени. Отвечай одним словом: женский или мужской.",
+            `Имя: «${firstName}»`,
+            { model: MODEL_LIGHT },
+          );
+          if (/женск/i.test(answer)) gender = "female";
+          else if (/мужск/i.test(answer)) gender = "male";
+        }
+      } catch { /* оставляем unknown */ }
+    }
+
+    ownerGenderCache = gender;
+    if (gender !== "unknown") {
+      const label = gender === "female" ? "женский" : "мужской";
+      void upsertFact(cfg.ownerTelegramId, "ПОЛ_ВЛАДЕЛЬЦА", `Пол: ${label}`).catch(() => {});
     }
     return gender;
   }
@@ -807,6 +847,16 @@ function setupBot(cfg: BotConfig): Bot {
         ? `мужского пола — обращайся к НЕМУ в мужском роде`
         : `пол неизвестен — определи по контексту переписки и обращайся соответственно`;
 
+    // Определяем пол самого владельца — переопределяет "женский род" базовой
+    // персоны Пятницы, т.к. здесь она говорит ОТ ЕГО лица, а не от своего.
+    const ownerGender = await resolveOwnerGender();
+    const ownerGenderNote =
+      ownerGender === "female"
+        ? `ты сама женского пола — о себе говори строго в женском роде: «сделала», «поняла», «ответила», «была»`
+        : ownerGender === "male"
+        ? `ты сам мужского пола — о себе говори строго в МУЖСКОМ роде: «сделал», «понял», «ответил», «был» — а НЕ «сделала», «поняла», «ответила»`
+        : `род определи по прошлым сообщениям владельца ниже`;
+
     // Образцы стиля владельца из этого чата (до 10 последних)
     const samples = ownerStyleSamples.get(chatId) ?? [];
     const styleBlock = samples.length > 0
@@ -814,6 +864,8 @@ function setupBot(cfg: BotConfig): Bot {
       : "";
 
     const systemExtra = `Сейчас ты — это владелец. Ты пишешь в своём личном Telegram от первого лица.
+
+ПЕРЕОПРЕДЕЛЕНИЕ РОДА: забудь указание "женский род" из своей базовой персоны Пятницы — оно здесь не действует, ты сейчас не Пятница, а сам владелец. ${ownerGenderNote}.
 
 Собеседника зовут ${senderName}, ${genderNote}.
 
