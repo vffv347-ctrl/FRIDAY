@@ -490,8 +490,10 @@ const TOOLS: Anthropic.Messages.ToolUnion[] = [
       required: ["confirmation_message", "task_prompt"],
     },
   },
-  { type: "web_search_20260209", name: "web_search" },
-  { type: "web_fetch_20260209", name: "web_fetch" },
+  // allowed_callers: ["direct"] — иначе Anthropic по умолчанию требует
+  // programmatic tool calling, которое Haiku не поддерживает (400).
+  { type: "web_search_20260209", name: "web_search", allowed_callers: ["direct"] },
+  { type: "web_fetch_20260209", name: "web_fetch", allowed_callers: ["direct"] },
 ];
 
 export type FridayCallbacks = {
