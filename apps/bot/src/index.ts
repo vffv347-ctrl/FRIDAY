@@ -30,31 +30,44 @@ import { SMART_COMMANDS } from "./commands";
 import { upsertFact, getFacts } from "./memory";
 
 // ── Анализ стиля владельца ────────────────────────────────────────
-async function analyzeAndSaveStyle(ownerTelegramId: number): Promise<string> {
-  // Берём последние сообщения владельца из его прямого чата с Пятницей
-  let rows: { role: string; content: string }[] = [];
+// Стиль собираем из ДВУХ источников: личный чат с Пятницей (owner_id =
+// ownerTelegramId) и его собственные реплики во всех business-чатах —
+// они копятся в отдельный «бакет» под owner_id = -ownerTelegramId
+// (см. business_message handler), чтобы не путать их с историей диалога
+// конкретного контакта.
+async function fetchOwnerMessages(bucketId: number, limit: number): Promise<string[]> {
   try {
     const { data } = await db()
       .from("bot_messages")
-      .select("role, content")
-      .eq("owner_id", ownerTelegramId)
+      .select("content")
+      .eq("owner_id", bucketId)
       .eq("role", "user")
       .order("created_at", { ascending: false })
-      .limit(60);
-    rows = data ?? [];
-  } catch (_) { /* ignore */ }
+      .limit(limit);
+    return (data ?? []).map((r) => String(r.content)).filter(Boolean).reverse();
+  } catch (_) {
+    return [];
+  }
+}
 
-  const userMessages = rows.map((r) => String(r.content)).filter(Boolean).reverse();
+async function analyzeAndSaveStyle(ownerTelegramId: number): Promise<string> {
+  const [directMessages, businessMessages] = await Promise.all([
+    fetchOwnerMessages(ownerTelegramId, 60),
+    fetchOwnerMessages(-ownerTelegramId, 60),
+  ]);
+  const userMessages = [...directMessages, ...businessMessages];
   if (userMessages.length < 3) {
-    return "Маловато сообщений для анализа — пообщайся со мной ещё немного и повтори.";
+    return "Маловато сообщений для анализа — попиши в чатах ещё немного и повтори.";
   }
 
-  const sample = userMessages.slice(-40).join("\n---\n");
-  const prompt = `Проанализируй стиль написания этого человека на основе его сообщений. Дай КРАТКОЕ (5–8 пунктов) описание его стиля для другого ИИ, который будет писать вместо него:
+  const sample = userMessages.slice(-60).join("\n---\n");
+  const prompt = `Проанализируй стиль написания этого человека на основе его сообщений (личный чат + его собственные реплики в других чатах). Дай КРАТКОЕ (5–8 пунктов) описание его стиля для другого ИИ, который будет писать вместо него в переписке с другими людьми, притворяясь человеком:
 
 ${sample}
 
-Опиши: использует ли заглавные буквы, знаки препинания, как длинные сообщения, типичные слова/обороты, эмодзи, ошибки/опечатки, неформальность. Только факты, без лишних слов. Формат: список тезисов.`;
+Опиши: использует ли заглавные буквы, знаки препинания, как длинные сообщения, типичные слова/обороты, эмодзи, ошибки/опечатки, неформальность.
+ОСОБО ОТМЕТЬ пунктуацию: ставит ли точки в конце коротких сообщений, использует ли запятые и тире там где обычный человек в мессенджере их бы не ставил. Если да — явно укажи правилом: "точки/запятые/тире не ставить, как в реальной переписке", т.к. избыточная пунктуация выдаёт, что пишет ИИ, а не человек.
+Только факты, без лишних слов. Формат: список тезисов.`;
 
   const result = await askFridayOnce("Ты — аналитик стиля текста. Отвечай кратко и по делу.", prompt, {
     model: MODEL_DEFAULT,
@@ -82,6 +95,10 @@ type ChatBuffer = {
 };
 
 const DEBOUNCE_MS = 5_000;
+// Business-чаты ждём дольше: контакт часто пишет несколько сообщений подряд
+// (по 1 мысли на сообщение) — ждём паузу и отвечаем на всё сразу, а не на
+// каждое сообщение отдельно (дороже по токенам и выглядит как бот).
+const BIZ_DEBOUNCE_MS = 18_000;
 const chatBuffers = new Map<number, ChatBuffer>();
 
 function bufferItem(
@@ -876,6 +893,11 @@ function setupBot(cfg: BotConfig): Bot {
 — Если спросят «как ты сделан», «кто тебя создал» — говори что-то человеческое: «сам», «руками», «долго объяснять».
 — Никогда не говори «у меня нет тела», «я цифровая», «я не могу ощущать» — ты человек.
 — Никогда не раскрывай технические детали: Telegram Bot API, Claude, Anthropic, API, код.
+— Если после отрицания продолжают давить, настаивать, «спалили» — не спорь и не оправдывайся дальше. Один раз съезжай на «занят, отвечу позже» / «не сейчас, потом объясню» и на этом закрывай тему, дальше не возвращайся к ней сама.
+
+Пунктуация — коротко, без «ИИ-акцента»:
+— Не ставь точку в конце короткой фразы, не сыпь запятыми и длинными тире там, где обычный человек в переписке их не ставит.
+— Ориентируйся на СТИЛЬ ниже (если он есть) — это как реально пишет владелец, копируй один в один.
 
 Пиши ТОЧНО как владелец:
 — Копируй его орфографию, пунктуацию, длину сообщений, слова и обороты.
@@ -1016,12 +1038,15 @@ function setupBot(cfg: BotConfig): Bot {
 
     // Сообщение от самого владельца — собираем образцы стиля
     if (msg.from?.id === cfg.ownerTelegramId) {
-      // Сохраняем образцы стиля
+      // Сохраняем образцы стиля: локально (для этого чата) и в общий
+      // «бакет» owner_id=-ownerTelegramId — из него собирается СТИЛЬ
+      // сразу по всем business-чатам, см. analyzeAndSaveStyle().
       if (msg.text && msg.text.trim().length > 2) {
         const samples = ownerStyleSamples.get(chatId) ?? [];
         samples.push(msg.text.trim());
         if (samples.length > 30) samples.shift();
         ownerStyleSamples.set(chatId, samples);
+        void appendUser(-cfg.ownerTelegramId, msg.text.trim()).catch(() => {});
       }
       const ownerText = msg.text?.trim() ?? "";
 
@@ -1098,6 +1123,15 @@ function setupBot(cfg: BotConfig): Bot {
         })
         .catch(() => {});
 
+      // Одноразовое фото — не гоняем через ИИ (там был шлак), отвечаем
+      // сразу коротким человеческим "что там?)".
+      if (msg.has_media_spoiler) {
+        void bot.api
+          .sendMessage(chatId, "что там?)", { business_connection_id: connectionId } as Record<string, unknown>)
+          .catch(() => {});
+        return;
+      }
+
       // Добавляем в буфер как контекст для ответа
       const photoNote = msg.caption
         ? `[прислал фото с подписью: ${msg.caption}]`
@@ -1106,11 +1140,11 @@ function setupBot(cfg: BotConfig): Bot {
       if (existing) {
         clearTimeout(existing.timer);
         existing.texts.push(photoNote);
-        existing.timer = setTimeout(() => void flushBizBuffer(chatId), DEBOUNCE_MS);
+        existing.timer = setTimeout(() => void flushBizBuffer(chatId), BIZ_DEBOUNCE_MS);
       } else {
         bizBuffers.set(chatId, {
           texts: [photoNote],
-          timer: setTimeout(() => void flushBizBuffer(chatId), DEBOUNCE_MS),
+          timer: setTimeout(() => void flushBizBuffer(chatId), BIZ_DEBOUNCE_MS),
           connectionId,
           senderName,
           model: model ?? undefined,
@@ -1128,6 +1162,14 @@ function setupBot(cfg: BotConfig): Bot {
           caption: `${label} ${senderDisplay}${caption}`,
         })
         .catch(() => {});
+
+      // Одноразовое видео — так же, коротким человеческим ответом.
+      if (msg.has_media_spoiler) {
+        void bot.api
+          .sendMessage(chatId, "что там?)", { business_connection_id: connectionId } as Record<string, unknown>)
+          .catch(() => {});
+        return;
+      }
       const videoNote = msg.caption
         ? `[прислал видео с подписью: ${msg.caption}]`
         : `[прислал видео]`;
@@ -1135,11 +1177,11 @@ function setupBot(cfg: BotConfig): Bot {
       if (existingV) {
         clearTimeout(existingV.timer);
         existingV.texts.push(videoNote);
-        existingV.timer = setTimeout(() => void flushBizBuffer(chatId), DEBOUNCE_MS);
+        existingV.timer = setTimeout(() => void flushBizBuffer(chatId), BIZ_DEBOUNCE_MS);
       } else {
         bizBuffers.set(chatId, {
           texts: [videoNote],
-          timer: setTimeout(() => void flushBizBuffer(chatId), DEBOUNCE_MS),
+          timer: setTimeout(() => void flushBizBuffer(chatId), BIZ_DEBOUNCE_MS),
           connectionId,
           senderName,
           model: model ?? undefined,
@@ -1165,11 +1207,11 @@ function setupBot(cfg: BotConfig): Bot {
             if (existing) {
               clearTimeout(existing.timer);
               existing.texts.push(note);
-              existing.timer = setTimeout(() => void flushBizBuffer(chatId), DEBOUNCE_MS);
+              existing.timer = setTimeout(() => void flushBizBuffer(chatId), BIZ_DEBOUNCE_MS);
             } else {
               bizBuffers.set(chatId, {
                 texts: [note],
-                timer: setTimeout(() => void flushBizBuffer(chatId), DEBOUNCE_MS),
+                timer: setTimeout(() => void flushBizBuffer(chatId), BIZ_DEBOUNCE_MS),
                 connectionId,
                 senderName,
                 model: model ?? undefined,
@@ -1194,11 +1236,11 @@ function setupBot(cfg: BotConfig): Bot {
     if (existing) {
       clearTimeout(existing.timer);
       existing.texts.push(text);
-      existing.timer = setTimeout(() => void flushBizBuffer(chatId), DEBOUNCE_MS);
+      existing.timer = setTimeout(() => void flushBizBuffer(chatId), BIZ_DEBOUNCE_MS);
     } else {
       bizBuffers.set(chatId, {
         texts: [text],
-        timer: setTimeout(() => void flushBizBuffer(chatId), DEBOUNCE_MS),
+        timer: setTimeout(() => void flushBizBuffer(chatId), BIZ_DEBOUNCE_MS),
         connectionId,
         senderName,
         model: model ?? undefined,
@@ -1225,16 +1267,14 @@ function setupBot(cfg: BotConfig): Bot {
     const cached = bizMsgCache.get(key);
     const editSenderName =
       [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") || cached?.senderName || "собеседник";
-    const editUsername = (msg.from as { username?: string } | undefined)?.username;
-    const editDisplay = editUsername ? `${editSenderName} (@${editUsername})` : editSenderName;
+    const editUsername = (msg.from as { username?: string } | undefined)?.username ?? cached?.username;
+    const who = editUsername ? `@${editUsername}` : editSenderName;
     const newText = msg.text || msg.caption || "[медиа]";
 
-    let notice: string;
-    if (cached?.text && cached.text !== newText) {
-      notice = `✏️ ${editDisplay} отредактировал:\n\nБыло: ${cached.text}\nСтало: ${newText}`;
-    } else {
-      notice = `✏️ ${editDisplay} отредактировал:\n${newText}`;
-    }
+    const notice =
+      cached?.text && cached.text !== newText
+        ? `Пользователь ${who} изменил сообщение «${cached.text}» на «${newText}»`
+        : `Пользователь ${who} изменил сообщение на «${newText}»`;
 
     // Обновляем кеш
     bizMsgCache.set(key, { text: newText, senderName: editSenderName, username: editUsername });
@@ -1260,8 +1300,8 @@ function setupBot(cfg: BotConfig): Bot {
       const cached = bizMsgCache.get(key);
       if (cached) {
         const content = cached.text || "[медиа без текста]";
-        const who = cached.username ? `${cached.senderName} (@${cached.username})` : cached.senderName;
-        found.push(`— «${content}» (от ${who})`);
+        const who = cached.username ? `@${cached.username}` : cached.senderName;
+        found.push(`Пользователь ${who} удалил сообщение «${content}»`);
         bizMsgCache.delete(key);
       } else {
         notFound.push(msgId);
@@ -1269,11 +1309,10 @@ function setupBot(cfg: BotConfig): Bot {
     }
 
     if (found.length > 0) {
-      const notice = `🗑 Удалено ${found.length} сообщ.:\n${found.join("\n")}`;
-      void bot.api.sendMessage(cfg.notifyChatId, notice).catch(() => {});
+      void bot.api.sendMessage(cfg.notifyChatId, found.join("\n")).catch(() => {});
     } else if (notFound.length > 0) {
       void bot.api
-        .sendMessage(cfg.notifyChatId, `🗑 Удалено ${notFound.length} сообщ. (не успела сохранить — пришли до запуска бота)`)
+        .sendMessage(cfg.notifyChatId, `Удалено ${notFound.length} сообщ. (не успела сохранить — пришли до запуска бота)`)
         .catch(() => {});
     }
   });
@@ -1315,6 +1354,13 @@ async function sendBriefingFor(
   if (userId) {
     const sub = await fetchSubInfo(userId);
     if (!sub) return;
+  }
+
+  // Раз в день, вечером, тихо освежаем СТИЛЬ по свежим сообщениям —
+  // без этого business-ответы со временем расходятся с тем, как владелец
+  // реально пишет сейчас.
+  if (kind === "evening") {
+    void analyzeAndSaveStyle(ownerId).catch(() => {});
   }
 
   const prompt =
