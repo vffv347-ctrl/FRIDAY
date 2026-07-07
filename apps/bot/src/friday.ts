@@ -588,6 +588,9 @@ function extractText(response: Anthropic.Message): string {
     .trim();
 }
 
+// ownerId — куда пишутся напоминания/задачи/память/энергия/команды. Это
+// ID владельца, а НЕ обязательно текущий чат (в business-режиме беседа
+// идёт в чате контакта, но всё персональное всегда должно уйти владельцу).
 async function executeTool(
   block: Anthropic.ToolUseBlock,
   chatId: number,
@@ -983,7 +986,10 @@ export async function runFriday(
       const results: Anthropic.ToolResultBlockParam[] = [];
       for (const block of response.content) {
         if (block.type === "tool_use") {
-          const result = await executeTool(block, chatId, callbacks);
+          // memId, не chatId: в business-режиме chatId — это чат контакта,
+          // а напоминания/задачи/память/энергия должны всегда писаться
+          // владельцу (иначе напоминание физически некому будет прислать).
+          const result = await executeTool(block, memId, callbacks);
           results.push({
             type: "tool_result",
             tool_use_id: block.id,
